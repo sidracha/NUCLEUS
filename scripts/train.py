@@ -126,8 +126,8 @@ def main(cfg: DictConfig) -> None:
     set_fp32_precision()
     
     run = wandb.init(
-        project="nucleus",
-        entity="hpcforge"
+        project="adversarial",
+        entity="srachabathuni-uci"
     )
     
     assert cfg.log_dir is not None, "Must set `log_dir` in hydra config"

@@ -1,0 +1,13 @@
+name: nucleus2_moe_fm
+train_module_name: flow_matching
+layout: "t h w c"
+params:
+  patch_size: 4
+  embed_dim: 256
+  moe_intermediate_dim: 1024
+  processor_blocks: 6
+  num_heads: 4
+  num_experts: 4
+  topk: 2
+  patching: "Linear"
+  activation_dtype: "bfloat16"

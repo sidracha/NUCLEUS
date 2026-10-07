@@ -6,7 +6,8 @@ from math import sqrt
 import wandb
 from omegaconf import OmegaConf, DictConfig
 import torch
-from torch.optim import AdamW, Adam, Muon
+from torch.optim import AdamW, Adam
+from muon import Muon
 from lion_pytorch import Lion
 import lightning as L
 
@@ -506,5 +507,8 @@ def get_train_module(module_name: str):
         # it at module top would be a circular import.
         from nucleus.models.nucleus2_moe_divfree import DivFreeForecastModule
         return DivFreeForecastModule
+    elif module_name == "flow_matching":
+        from nucleus.models.flow_matching_module import FlowMatchingModule
+        return FlowMatchingModule
     else:
         raise ValueError(f"Module {module_name} not supported")

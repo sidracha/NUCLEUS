@@ -202,12 +202,11 @@ class Nucleus1SpatialNeighborhoodAttention(nn.Module):
             lambda qkv: rearrange(qkv, "bt heads h w head_dim -> bt h w heads head_dim").contiguous(), [q, k, v]
         )
         
-        output = natten.na2d(
+        output = natten.functional.na2d(
             q,
             k,
             v,
             kernel_size=5,
-            stride=1,
             dilation=1,
         )
         

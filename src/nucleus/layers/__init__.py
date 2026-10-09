@@ -1,6 +1,7 @@
 from .positional_encoding import ContinuousPositionBias1D, RelativePositionBias
 from .mlp import GeluMLP, FiLMMLP
 from .adaptive_layernorm import AdaptiveLayerNorm
+from .fm_time_embed import FMTimeEmbed
 from .droppath import DropPath
 from .gaussian_filter import GaussianFilter
 from .patching import HMLPEmbed, HMLPDebed, LinearEmbed, LinearDebed, OverlappingPatchDebed, AdaptiveDebed, AdaptiveEmbed

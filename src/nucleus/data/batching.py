@@ -14,6 +14,7 @@ class Data:
     dy: float
     rollout_steps: Optional[int] = None
     sim_params_tensor: Optional[torch.Tensor] = None
+    condition: Optional[torch.Tensor] = None  # static (H, W, K) conditioning maps
 
     def to_collated_batch(self):
         return collate([self])
@@ -29,6 +30,7 @@ class CollatedBatch:
     dy: torch.Tensor
     rollout_steps: Optional[torch.Tensor] = None
     sim_params_tensor: Optional[torch.Tensor] = None
+    condition: Optional[torch.Tensor] = None  # static (B, H, W, K) conditioning maps
 
     def pin_memory(self):
         return CollatedBatch(
@@ -41,6 +43,7 @@ class CollatedBatch:
             dy=self.dy.pin_memory(),
             rollout_steps=self.rollout_steps,
             sim_params_tensor=self.sim_params_tensor.pin_memory() if self.sim_params_tensor is not None else None,
+            condition=self.condition.pin_memory() if self.condition is not None else None,
         )
 
     def to(self, device: torch.device, non_blocking: bool = False):
@@ -54,6 +57,7 @@ class CollatedBatch:
             dy=self.dy.to(device, non_blocking=non_blocking),
             rollout_steps=self.rollout_steps,
             sim_params_tensor=self.sim_params_tensor.to(device, non_blocking=non_blocking) if self.sim_params_tensor is not None else None,
+            condition=self.condition.to(device, non_blocking=non_blocking) if self.condition is not None else None,
         )
 
     def detach(self):
@@ -67,6 +71,7 @@ class CollatedBatch:
             dy=self.dy.detach(),
             rollout_steps=self.rollout_steps,
             sim_params_tensor=self.sim_params_tensor.detach() if self.sim_params_tensor is not None else None,
+            condition=self.condition.detach() if self.condition is not None else None,
         )
 
     def get_input(self):
@@ -83,7 +88,8 @@ class CollatedBatch:
             dx=self.dx,
             dy=self.dy,
             rollout_steps=self.rollout_steps,
-            sim_params_tensor=self.sim_params_tensor
+            sim_params_tensor=self.sim_params_tensor,
+            condition=self.condition,
         )
 
     def fliplr(self):
@@ -97,7 +103,9 @@ class CollatedBatch:
             dx=self.dx,
             dy=self.dy,
             rollout_steps=self.rollout_steps,
-            sim_params_tensor=self.sim_params_tensor
+            sim_params_tensor=self.sim_params_tensor,
+            # mirrored maps stay consistent: the x-coordinate channel becomes -x like the flipped domain
+            condition=torch.flip(self.condition, dims=[2]) if self.condition is not None else None,
         )
 
     def noise_(self, scale):
@@ -114,7 +122,8 @@ class CollatedBatch:
             dx=self.dx,
             dy=self.dy,
             rollout_steps=self.rollout_steps,
-            sim_params_tensor=self.sim_params_tensor
+            sim_params_tensor=self.sim_params_tensor,
+            condition=self.condition,
         )
 
     def unnormalize(self, normalizer: Normalizer):
@@ -127,7 +136,8 @@ class CollatedBatch:
             dx=self.dx,
             dy=self.dy,
             rollout_steps=self.rollout_steps,
-            sim_params_tensor=self.sim_params_tensor
+            sim_params_tensor=self.sim_params_tensor,
+            condition=self.condition,
         )
 
     def get_temps(self):
@@ -155,7 +165,8 @@ def make_data(
     downsample_factor: int,
     fluid_params: List[str],
     heater_params: List[str],
-    global_params: List[str]
+    global_params: List[str],
+    condition: Optional[torch.Tensor] = None,
 ):
     dx = (sim_params_dict["x_max"] - sim_params_dict["x_min"]) / (sim_params_dict["num_blocks_x"] * int(sim_params_dict["nx_block"]))
     dy = (sim_params_dict["y_max"] - sim_params_dict["y_min"]) / (sim_params_dict["num_blocks_y"] * int(sim_params_dict["ny_block"]))
@@ -176,7 +187,8 @@ def make_data(
         y_grid=y_grid,
         dx=dx,
         dy=dy,
-        sim_params_tensor=build_sim_params_tensor(sim_params_dict, fluid_params, heater_params, global_params)
+        sim_params_tensor=build_sim_params_tensor(sim_params_dict, fluid_params, heater_params, global_params),
+        condition=condition,
     )
 
 def collate(data: List[Data]):
@@ -189,4 +201,5 @@ def collate(data: List[Data]):
         dx=torch.tensor([d.dx for d in data]),
         dy=torch.tensor([d.dy for d in data]),
         sim_params_tensor=torch.stack([d.sim_params_tensor for d in data], dim=0),
+        condition=torch.stack([d.condition for d in data]) if data[0].condition is not None else None,
     )

@@ -4,6 +4,7 @@ import h5py
 import json
 import torch
 
+from nucleus.data.conditioning import condition_map_kind, condition_maps
 from nucleus.data.layout import convert_layout
 from nucleus.trajectory import Trajectory
 from nucleus.models.nucleus2_moe_divfree import Nucleus2MoEDivFree
@@ -67,8 +68,8 @@ def run_test(cfg, model, normalizer, test_file_path: str, trajectory_steps: int)
                 initial_trajectory,
                 normalizer,
                 dx=1/32,
-                input_time_window_size=8,
-                output_time_window_size=8,
+                input_time_window_size=cfg.history_time_window,
+                output_time_window_size=cfg.future_time_window,
                 trajectory_steps=trajectory_steps,
                 use_sdf_reinit=False,
                 clip_temp=False,
@@ -87,17 +88,24 @@ def run_test(cfg, model, normalizer, test_file_path: str, trajectory_steps: int)
         else:
             initial_state = gt_trajectory[window][None, :].to(device)
             initial_cells = convert_layout(initial_state, target_layout=model.layout, source_layout="t h w c")
+            condition = None
+            map_kind = condition_map_kind(model.config)
+            if map_kind is not None:
+                _, height, width, _ = gt_trajectory.shape
+                condition = condition_maps(sim_params_dict, normalizer, height, width, map_kind)[None].to(device)
             pred_trajectory: torch.Tensor = model.forward_trajectory(
                 initial_cells,
                 sim_params_dict,
                 normalizer,
                 dx=1/32,
-                input_time_window_size=8,
-                output_time_window_size=8,
+                input_time_window_size=cfg.history_time_window,
+                output_time_window_size=cfg.future_time_window,
                 trajectory_steps=trajectory_steps,
                 use_sdf_reinit=False,
                 return_moe_outputs=False,
-                clip_temp=False
+                clip_temp=False,
+                # only NUCLEUS-2 style models accept conditioning maps
+                **({"condition": condition} if condition is not None else {}),
             )
             pred_trajectory = convert_layout(pred_trajectory, target_layout="t h w c", source_layout=model.layout).squeeze(0)
             targets = gt_trajectory[cfg.start_time : cfg.start_time + trajectory_steps]

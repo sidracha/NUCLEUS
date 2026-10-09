@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -5,59 +6,133 @@ import torch.nn.functional as F
 
 from nucleus.data.batching import CollatedBatch
 from nucleus.models.modules import MoEConditionedForecastModule
+from nucleus.noise import LogUniformNoise, SDFAugmentation
+
+FLOW_TIME_BIN_EDGES = (0.0, 0.25, 0.5, 0.75, 1.0)
+PREDICTION_TARGETS = ("velocity", "endpoint")
+
+
+@dataclass
+class FlowPrediction:
+    flow_time: torch.Tensor
+    v_pred: torch.Tensor
+    v_target: torch.Tensor
+    delta_pred: torch.Tensor
+    delta: torch.Tensor
+    moe_outputs: list
+
+
+def remaining_flow_time(flow_time: torch.Tensor) -> torch.Tensor:
+    return (1.0 - flow_time)[:, :, None, None, None]
+
+
+def per_sample_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return (prediction - target).pow(2).flatten(start_dim=1).mean(dim=1)
 
 
 class FlowMatchingModule(MoEConditionedForecastModule):
     """
-    physics-conditioned flow matching for forecasting
+    physics-conditioned residual flow matching for forecasting
 
-    z0 = (input, gaussian noise)    -- starting point, target slot is pure noise
-    y  = (input, target)            -- endpoint, target slot is ground truth
-    t ~ uniform(0, 1)
+    residual (top-level key in model_cfg, default true):
+        true:  delta = target - input[:, -1:]    -- flow toward the change from the last context frame
+        false: delta = target                    -- flow toward the clean target frame, no anchor
+    t ~ uniform(0, 1) ** flow_time_power
 
-    zt = (1-t)*z0 + t*y = (input, (1-t)*noise + t*target)
+    zt = (1-t)*noise + t*delta
         -- input frames are stationary anchors, only the target slot moves
 
-    objective = min MSE(model(zt, t)[T_out frames], target - noise)
-        -- model sees full (T_in + T_out) sequence via time concatenation
-        -- only supervised on the last T_out frames
-        -- t conditioned via dedicated per-block FiLM layer
+    prediction_target (top-level key in model_cfg):
+        velocity: model(zt, t) -> v,     loss = MSE(v, delta - noise)
+        endpoint: model(zt, t) -> delta, loss = MSE(delta_hat, delta)
+                  (the velocity loss weighted by (1-t)^2, without the noise copying)
 
-    inference: start from z0 = (input, noise), integrate dz/dt = model(zt, t)
-        -- ex. forward euler: zt+dt = zt + dt * model(zt, t)
-        -- take last T_out frames of z1 as the forecast
+    inference: start from zt=noise, integrate dz/dt = v(zt, t) to get delta_hat
+        -- endpoint models give v = (delta_hat - zt) / (1 - t)
+        -- forecast = input[:, -1:] + delta_hat if residual, else delta_hat
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.prediction_target = self.model_cfg.get("prediction_target", "velocity")
+        if self.prediction_target not in PREDICTION_TARGETS:
+            raise ValueError(f"prediction_target must be one of {PREDICTION_TARGETS}, got {self.prediction_target}")
+        # training draws t = u ** flow_time_power; powers above 1 put more samples at small t,
+        # where the forecast must come from the context alone
+        self.flow_time_power = float(self.model_cfg.get("flow_time_power", 1.0))
+        # residual: flow toward (target - last context frame); otherwise flow toward the clean target
+        self.residual = bool(self.model_cfg.get("residual", True))
+        # reuse NUCLEUS's own augmentation objects so both models see identically corrupted
+        # context; field dropout is skipped because zeroing the anchor breaks the residual target
+        wanted_types = ((LogUniformNoise,) if self.model_cfg.get("context_noise", False) else ()) \
+            + ((SDFAugmentation,) if self.model_cfg.get("sdf_corruptions", False) else ())
+        self.context_augmentations = [
+            augmentation for augmentation in self.augmentations if wanted_types and isinstance(augmentation, wanted_types)
+        ]
+
+    def _augment_context(self, batch: CollatedBatch) -> CollatedBatch:
+        # applied before _sample_flow: in residual mode the anchor is then the noisy last frame,
+        # in full-field mode the target stays clean and only the conditioning is corrupted
+        with torch.no_grad():
+            for augmentation in self.context_augmentations:
+                batch.input = augmentation(batch.input)
+        return batch
+
     def _sample_flow(
-        self, batch: CollatedBatch
+        self, batch: CollatedBatch, flow_time_power: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (model_input, t, v_target)."""
+        """Returns (model_input, t, v_target) for residual flow matching."""
         y = batch.target  # (B, T_out, H, W, C)
+        # the flow's endpoint: the change from the last context frame (broadcast over T_out), or the clean target itself
+        delta = y - batch.input[:, -1:] if self.residual else y  # (B, T_out, H, W, C)
         B = y.shape[0]
 
-        noise = torch.randn_like(y)
-        t = torch.rand(B, device=y.device, dtype=y.dtype)
+        noise = torch.randn_like(delta)
+        t = torch.rand(B, device=y.device, dtype=y.dtype) ** flow_time_power
 
         t_bcast = t[:, None, None, None, None]
-        zt = (1.0 - t_bcast) * noise + t_bcast * y
+        zt = (1.0 - t_bcast) * noise + t_bcast * delta
 
         # model sees full sequence; input frames are stationary anchors
         model_input = torch.cat([batch.input, zt], dim=1)  # (B, T_in + T_out, H, W, C)
-        v_target = y - noise  # (B, T_out, H, W, C)
+        v_target = delta - noise  # (B, T_out, H, W, C)
 
         return model_input, t[:, None], v_target  # t: (B, 1) for AdaptiveLayerNorm
 
+    def _predict(self, batch: CollatedBatch, flow_time_power: float = 1.0) -> FlowPrediction:
+        model_input, flow_time, v_target = self._sample_flow(batch, flow_time_power)
+        num_input_frames = batch.input.shape[1]
+        model_output, moe_outputs = self.model.step(
+            model_input, batch.sim_params_tensor, flow_time, T_in=num_input_frames,
+            condition=getattr(batch, "condition", None),
+        )
+        zt = model_input[:, num_input_frames:]
+        remaining = remaining_flow_time(flow_time)
+        # straight-line flow: velocity and endpoint are related by delta = zt + (1-t) * v
+        delta = zt + remaining * v_target
+        if self.prediction_target == "endpoint":
+            delta_pred = model_output
+            # the floor keeps the implied velocity finite as t -> 1; only diagnostics use it
+            v_pred = (delta_pred - zt) / remaining.clamp(min=1e-3)
+        else:
+            v_pred = model_output
+            delta_pred = zt + remaining * v_pred
+        return FlowPrediction(flow_time, v_pred, v_target, delta_pred, delta, moe_outputs)
+
+    def _trained_pair(self, prediction: FlowPrediction) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.prediction_target == "endpoint":
+            return prediction.delta_pred, prediction.delta
+        return prediction.v_pred, prediction.v_target
+
     def training_step(self, batch: CollatedBatch, batch_idx: int) -> torch.Tensor:
-        model_input, t, v_target = self._sample_flow(batch)
-        T_in = batch.input.shape[1]
-
         torch.compiler.cudagraph_mark_step_begin()
-        v_pred, moe_outputs = self.model.step(model_input, batch.sim_params_tensor, t, T_in=T_in)
+        prediction = self._predict(self._augment_context(batch), self.flow_time_power)
+        trained_pred, trained_target = self._trained_pair(prediction)
 
-        data_loss = F.mse_loss(v_pred, v_target)
-        aux_loss, _ = self._router_loss(moe_outputs)
+        data_loss = F.mse_loss(trained_pred, trained_target)
+        aux_loss, _ = self._router_loss(prediction.moe_outputs)
         loss = data_loss + aux_loss
-        self._update_router_bias(moe_outputs)
+        self._update_router_bias(prediction.moe_outputs)
 
         log_dict = {
             "train/loss": loss,
@@ -66,28 +141,62 @@ class FlowMatchingModule(MoEConditionedForecastModule):
             "train/learning_rate": self.get_current_lr(),
         }
         log_dict = self.log_step_metrics(
-            log_dict, v_pred, v_target,
+            log_dict, trained_pred, trained_target,
             batch.dx[0].item(), batch.dy[0].item(), "train",
         )
-        log_dict = self._moe_metrics(moe_outputs, log_dict, "train")
+        log_dict = self._moe_metrics(prediction.moe_outputs, log_dict, "train")
         self.default_log_dict(log_dict)
         return loss
 
     def validation_step(self, batch: CollatedBatch, batch_idx: int) -> torch.Tensor:
-        model_input, t, v_target = self._sample_flow(batch)
-        T_in = batch.input.shape[1]
-
-        v_pred, moe_outputs = self.model.step(model_input, batch.sim_params_tensor, t, T_in=T_in)
-        loss = F.mse_loss(v_pred, v_target)
+        # always uniform t, so validation averages stay comparable across training t distributions
+        prediction = self._predict(batch)
+        trained_pred, trained_target = self._trained_pair(prediction)
+        loss = F.mse_loss(trained_pred, trained_target)
 
         if batch_idx == 0:
-            self.validation_sample = (batch.target.detach(), v_target.detach(), v_pred.detach())
+            self.validation_sample = (batch.target.detach(), trained_target.detach(), trained_pred.detach())
 
-        log_dict = {"val/loss": loss}
+        self._accumulate_flow_time_binned_errors(prediction)
+        log_dict = {
+            "val/loss": loss,
+            "val/endpoint_mse": F.mse_loss(prediction.delta_pred, prediction.delta),
+            # copy-last-frame error, computed directly so it means the same thing in both modes
+            "val/persistence_mse": F.mse_loss(batch.input[:, -1:].expand_as(batch.target), batch.target),
+        }
         log_dict = self.log_step_metrics(
-            log_dict, v_pred, v_target,
+            log_dict, trained_pred, trained_target,
             batch.dx[0].item(), batch.dy[0].item(), "val",
         )
-        log_dict = self._moe_metrics(moe_outputs, log_dict, "val")
+        log_dict = self._moe_metrics(prediction.moe_outputs, log_dict, "val")
         self.default_log_dict(log_dict)
         return loss
+
+    def on_validation_epoch_start(self):
+        super().on_validation_epoch_start()
+        num_bins = len(FLOW_TIME_BIN_EDGES) - 1
+        self._flow_time_bin_boundaries = torch.tensor(FLOW_TIME_BIN_EDGES[1:-1], device=self.device)
+        self._flow_time_bin_error_sums = {
+            "loss": torch.zeros(num_bins, device=self.device),
+            "endpoint": torch.zeros(num_bins, device=self.device),
+        }
+        self._flow_time_bin_count = torch.zeros(num_bins, device=self.device)
+
+    def _accumulate_flow_time_binned_errors(self, prediction: FlowPrediction):
+        bin_index = torch.bucketize(prediction.flow_time.flatten(), self._flow_time_bin_boundaries, right=True)
+        errors = {
+            "loss": per_sample_mse(prediction.v_pred, prediction.v_target),
+            "endpoint": per_sample_mse(prediction.delta_pred, prediction.delta),
+        }
+        for name, error in errors.items():
+            self._flow_time_bin_error_sums[name].index_add_(0, bin_index, error)
+        self._flow_time_bin_count.index_add_(0, bin_index, torch.ones_like(errors["loss"]))
+
+    def on_validation_epoch_end(self):
+        super().on_validation_epoch_end()
+        for bin_index, (low, high) in enumerate(zip(FLOW_TIME_BIN_EDGES[:-1], FLOW_TIME_BIN_EDGES[1:])):
+            count = self._flow_time_bin_count[bin_index]
+            if count == 0:
+                continue
+            for name, error_sums in self._flow_time_bin_error_sums.items():
+                self.default_log(f"val_flow_time/{name}_t{low:.2f}-{high:.2f}", error_sums[bin_index] / count)

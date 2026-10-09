@@ -2,7 +2,6 @@ import os
 import pprint
 import time
 import signal
-from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +20,7 @@ from lightning.pytorch.plugins.environments import SLURMEnvironment
 import braceexpand
 
 from nucleus.data.batching import collate
+from nucleus.data.conditioning import condition_map_kind
 from nucleus.data.normalize import get_normalizer
 from nucleus.data import get_pydataset, forecast_web_dataset
 from nucleus.models.modules import get_train_module
@@ -133,16 +133,9 @@ def main(cfg: DictConfig) -> None:
     assert cfg.log_dir is not None, "Must set `log_dir` in hydra config"
     print(f"logging to {cfg.log_dir}")
 
-    # Setup Wandb Logger.
-    log_id_parts = [
-        cfg.model_cfg.name.lower(),
-        cfg.data_cfg.dataset.lower(),
-        date.today().strftime("%Y-%m-%d"),
-    ]
-    if os.getenv("SLURM_JOB_ID") is not None:
-        log_id_parts.append(os.getenv("SLURM_JOB_ID"))
-    
-    log_id = "_".join(log_id_parts)
+    # Name the run directory after the wandb run so local checkpoints map 1:1 to the
+    # dashboard; disabled/offline runs may have no name, but always have an id.
+    log_id = run.name or run.id
     cfg.log_dir = os.path.join(cfg.log_dir, log_id)
     os.makedirs(cfg.log_dir, exist_ok=True)
     
@@ -213,6 +206,10 @@ def main(cfg: DictConfig) -> None:
             input_fields=cfg.data_cfg.input_fields,
             output_fields=cfg.data_cfg.output_fields,
         )
+        map_kind = condition_map_kind(getattr(train_module.model, "config", None))
+        if map_kind is not None:
+            # only the in-memory dataset builds conditioning maps; others fail loudly on the extra argument
+            hdf5_kwargs["condition_map_kind"] = map_kind
         train_dataset = dataset_cls(
             filenames=cfg.data_cfg.train_paths,
             augment=True,
@@ -241,7 +238,8 @@ def main(cfg: DictConfig) -> None:
         val_dataset,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=2,
+        # matches the train loader; with 2 workers per-sample CPU work starved the GPU during validation
+        num_workers=8,
         pin_memory=True,
         prefetch_factor=3,
         persistent_workers=not use_webdataset,
@@ -305,6 +303,10 @@ def main(cfg: DictConfig) -> None:
     if is_leader_process():
         pp = pprint.PrettyPrinter(depth=4)
         pp.pprint(cfg)
+
+    if cfg.get("validate_only", False):
+        trainer.validate(train_module, dataloaders=val_dataloader)
+        return
 
     trainer.fit(
         train_module,

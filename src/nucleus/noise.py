@@ -150,3 +150,141 @@ class BubbleResize(PhaseAugmentation):
             return _dilate_mask(vapor, radius)  # grow
         # eroding the vapor region is removing cells within radius of any liquid.
         return vapor & ~_dilate_mask(~vapor, radius)
+
+
+def _smooth_noise(batch_size: int, height: int, width: int, length_scale_cells: float, device: torch.device) -> torch.Tensor:
+    # unit-variance noise varying over roughly length_scale_cells grid cells, shape (B, H, W);
+    # defined in cells so the corruption looks the same at any resolution
+    coarse_size = max(2, round(max(height, width) / length_scale_cells))
+    coarse = torch.randn(batch_size, 1, coarse_size, coarse_size, device=device)
+    smooth = F.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False)[:, 0]
+    return smooth / smooth.flatten(1).std(dim=1).clamp(min=1e-6)[:, None, None]
+
+
+class SDFAugmentation:
+    r"""
+    Base class for perturbations of a normalized (B, T, H, W, C) context whose channel 0
+    is the signed distance field (vapor where the SDF is positive). Each sample is
+    perturbed independently with probability `active_prob`; distances are handled in
+    physical units, so `cell_size` corresponds to one grid cell.
+    """
+    def __init__(self, sdf_mean: float, sdf_std: float, domain_size: float, active_prob: float):
+        self.sdf_mean = sdf_mean
+        self.sdf_std = sdf_std
+        self.domain_size = domain_size
+        self.active_prob = active_prob
+
+    def __call__(self, context: torch.Tensor) -> torch.Tensor:
+        assert context.dim() == 5, "context must be (B, T, H, W, C)"
+        active = torch.rand(context.shape[0], device=context.device) < self.active_prob
+        if not active.any():
+            return context
+        perturbed = self._perturb(context, cell_size=self.domain_size / context.shape[3])
+        return torch.where(active[:, None, None, None, None], perturbed, context)
+
+    def _raw_sdf(self, context: torch.Tensor) -> torch.Tensor:
+        return context[..., 0] * self.sdf_std + self.sdf_mean
+
+    def _with_raw_sdf(self, context: torch.Tensor, raw_sdf: torch.Tensor) -> torch.Tensor:
+        return torch.cat([((raw_sdf - self.sdf_mean) / self.sdf_std)[..., None], context[..., 1:]], dim=-1)
+
+    def _perturb(self, context: torch.Tensor, cell_size: float) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class SDFSpuriousSpecks(SDFAugmentation):
+    r"""
+    Inserts a few tiny spurious bubbles into bulk liquid, as a proper distance field
+    (union of the existing SDF with small discs), so the model learns to remove them.
+    """
+    def __init__(self, sdf_mean, sdf_std, domain_size, active_prob=0.3, max_specks=3,
+                 radius_cells=(0.5, 1.5), bulk_margin_cells=2.0):
+        super().__init__(sdf_mean, sdf_std, domain_size, active_prob)
+        self.max_specks = max_specks
+        self.radius_cells = radius_cells
+        self.bulk_margin_cells = bulk_margin_cells
+
+    def _perturb(self, context, cell_size):
+        batch, _, height, width, _ = context.shape
+        raw_sdf = self._raw_sdf(context)
+        centers = torch.rand(batch, self.max_specks, 2, device=context.device) * torch.tensor([height, width], device=context.device)
+        radii = torch.empty(batch, self.max_specks, device=context.device).uniform_(*self.radius_cells) * cell_size
+        # only place specks where the last context frame is liquid well away from any bubble
+        row, column = centers[..., 0].long().clamp(max=height - 1), centers[..., 1].long().clamp(max=width - 1)
+        center_sdf = raw_sdf[torch.arange(batch, device=context.device)[:, None], -1, row, column]
+        radii = torch.where(center_sdf < -self.bulk_margin_cells * cell_size, radii, torch.full_like(radii, -1e6))
+        rows = torch.arange(height, device=context.device) + 0.5
+        columns = torch.arange(width, device=context.device) + 0.5
+        distance = torch.sqrt((rows[None, None, :, None] - centers[..., 0, None, None]) ** 2
+                              + (columns[None, None, None, :] - centers[..., 1, None, None]) ** 2) * cell_size
+        speck_sdf = (radii[..., None, None] - distance).amax(dim=1)  # (B, H, W)
+        return self._with_raw_sdf(context, torch.maximum(raw_sdf, speck_sdf[:, None]))
+
+
+class SDFBubbleResize(SDFAugmentation):
+    r"""
+    Adds a smooth spatially varying offset of up to `max_shift_cells` to the SDF, which
+    moves every nearby interface by about that distance: bubbles grow in some regions
+    and shrink in others, mimicking volume errors.
+    """
+    def __init__(self, sdf_mean, sdf_std, domain_size, active_prob=0.3, max_shift_cells=1.0, length_scale_cells=16):
+        super().__init__(sdf_mean, sdf_std, domain_size, active_prob)
+        self.max_shift_cells = max_shift_cells
+        self.length_scale_cells = length_scale_cells
+
+    def _perturb(self, context, cell_size):
+        batch, _, height, width, _ = context.shape
+        shift = _smooth_noise(batch, height, width, self.length_scale_cells, context.device).clamp(-2.0, 2.0) / 2.0
+        return self._with_raw_sdf(context, self._raw_sdf(context) + (self.max_shift_cells * cell_size * shift)[:, None])
+
+
+class SmoothFieldWarp(SDFAugmentation):
+    r"""
+    Displaces all fields by one smooth random displacement field of up to
+    `max_shift_cells`, mimicking interfaces and flow structures that drifted slightly.
+    """
+    def __init__(self, sdf_mean, sdf_std, domain_size, active_prob=0.3, max_shift_cells=0.75, length_scale_cells=16):
+        super().__init__(sdf_mean, sdf_std, domain_size, active_prob)
+        self.max_shift_cells = max_shift_cells
+        self.length_scale_cells = length_scale_cells
+
+    def _perturb(self, context, cell_size):
+        batch, frames, height, width, channels = context.shape
+        displacement = torch.stack([_smooth_noise(batch, height, width, self.length_scale_cells, context.device)
+                                    for _ in range(2)], dim=-1).clamp(-2.0, 2.0) / 2.0 * self.max_shift_cells
+        rows = torch.linspace(-1 + 1 / height, 1 - 1 / height, height, device=context.device)
+        columns = torch.linspace(-1 + 1 / width, 1 - 1 / width, width, device=context.device)
+        grid_row, grid_column = torch.meshgrid(rows, columns, indexing="ij")
+        # grid_sample takes (x, y) = (column, row) in [-1, 1]; one cell is 2 / size
+        grid = torch.stack([grid_column + displacement[..., 1] * 2 / width,
+                            grid_row + displacement[..., 0] * 2 / height], dim=-1)
+        fields = context.permute(0, 1, 4, 2, 3).reshape(batch, frames * channels, height, width)
+        warped = F.grid_sample(fields, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        return warped.reshape(batch, frames, channels, height, width).permute(0, 1, 3, 4, 2)
+
+
+class SmoothFieldNoise(SDFAugmentation):
+    r"""
+    Spatially correlated noise on every field, summed over several length scales, with
+    a per-sample log-uniform amplitude. Complements white LogUniformNoise, which only
+    teaches the model to ignore pixel-scale errors.
+    """
+    def __init__(self, sdf_mean, sdf_std, domain_size, active_prob=0.5, min_std=0.005, max_std=0.05,
+                 length_scales_cells=(2, 4, 8, 16)):
+        super().__init__(sdf_mean, sdf_std, domain_size, active_prob)
+        self.min_std, self.max_std = min_std, max_std
+        self.length_scales_cells = length_scales_cells
+
+    def _perturb(self, context, cell_size):
+        batch, frames, height, width, channels = context.shape
+        noise = sum(_smooth_noise(batch * frames * channels, height, width, scale, context.device)
+                    for scale in self.length_scales_cells)
+        noise = noise / math.sqrt(len(self.length_scales_cells))
+        noise = noise.reshape(batch, frames, channels, height, width).permute(0, 1, 3, 4, 2)
+        log_std = torch.empty(batch, device=context.device).uniform_(math.log(self.min_std), math.log(self.max_std))
+        return context + noise * log_std.exp()[:, None, None, None, None]
+
+
+def sdf_context_corruptions(sdf_mean: float, sdf_std: float, domain_size: float) -> list:
+    shared = dict(sdf_mean=sdf_mean, sdf_std=sdf_std, domain_size=domain_size)
+    return [SDFSpuriousSpecks(**shared), SDFBubbleResize(**shared), SmoothFieldWarp(**shared), SmoothFieldNoise(**shared)]

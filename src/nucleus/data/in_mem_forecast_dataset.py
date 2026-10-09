@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from nucleus.data.batching import Data
 from nucleus.data.batching import make_data
+from nucleus.data.conditioning import condition_maps
 from nucleus.data.normalize import Normalizer
 from nucleus.data.layout import convert_layout
 
@@ -27,6 +28,7 @@ class InMemForecastDataset(Dataset):
         layout: str,
         normalizer: Optional[Normalizer],
         augment: bool = False,
+        condition_map_kind: Optional[str] = None,
     ):
         super().__init__()
         self.filenames = filenames
@@ -40,6 +42,7 @@ class InMemForecastDataset(Dataset):
         self.layout = layout
         self.normalizer = normalizer
         self.augment = augment
+        self.condition_map_kind = condition_map_kind
         
         if input_fields is not None:
             self.input_fields = input_fields
@@ -61,6 +64,15 @@ class InMemForecastDataset(Dataset):
             with open(sim_params_file, "r", encoding="utf-8") as f:
                 sim_params_json = json.load(f)
             self.sim_params.append(sim_params_json)
+
+        self.condition = [self._build_condition_maps(file_idx) for file_idx in range(len(self.filenames))] \
+            if condition_map_kind else None
+
+    def _build_condition_maps(self, file_idx: int) -> torch.Tensor:
+        if self.normalizer is None:
+            raise ValueError("condition maps are built in normalized units, so a normalizer is required")
+        _, height, width = self.data[file_idx][self.input_fields[0]].shape
+        return condition_maps(self.sim_params[file_idx], self.normalizer, height, width, self.condition_map_kind)
 
     def _load_data(self):
         hdf5_files = [h5.File(filename, "r") for filename in self.filenames]
@@ -116,7 +128,8 @@ class InMemForecastDataset(Dataset):
         sim_params = self.sim_params[file_idx]
         bulk_temp = int(sim_params["bulk_temp"])
         
-        if self.augment and random.random() < 0.5:
+        flipped = self.augment and random.random() < 0.5
+        if flipped:
             # [T H W C], we flip along the width (dim=2)
             inp_data = torch.flip(inp_data, dims=[2])
             out_data = torch.flip(out_data, dims=[2])
@@ -141,5 +154,12 @@ class InMemForecastDataset(Dataset):
             downsample_factor=1,
             fluid_params=self.fluid_params,
             heater_params=self.heater_params,
-            global_params=self.global_params
+            global_params=self.global_params,
+            condition=self._condition_for(file_idx, flipped),
         )
+
+    def _condition_for(self, file_idx: int, flipped: bool) -> Optional[torch.Tensor]:
+        if self.condition is None:
+            return None
+        # (H, W, K): mirror along the width with the fields; the x channel then reads -x like the flipped domain
+        return torch.flip(self.condition[file_idx], dims=[1]) if flipped else self.condition[file_idx]

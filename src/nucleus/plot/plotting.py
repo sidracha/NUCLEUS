@@ -7,7 +7,7 @@ from matplotlib.colors import Normalize, TwoSlopeNorm, SymLogNorm, LogNorm, Line
 import seaborn as sns
 from typing import Optional, Tuple
 from nucleus.utils.physical_metrics import vorticity
-from nucleus.test import TestResults
+from nucleus.run_forward_trajectory import TestResults
 import joblib
 import numpy as np
 from scipy.stats import wasserstein_distance

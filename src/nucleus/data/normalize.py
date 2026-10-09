@@ -234,6 +234,18 @@ class StandardNormalizer(Normalizer):
             bt = bulk_temp
         return temp * self.constants.temp_std + self.constants.temp_mean + bt
 
+class NonDimensionalTempNormalizer(StandardNormalizer):
+    # BubbleML_2 stores temperature non-dimensionally (0 = bulk, 1 = wall), so the
+    # dimensional bulk temperature from the sim params must not be subtracted.
+    def normalize_scalar_with_temp(self, scalar: float, bulk_temp: float) -> float:
+        return (scalar - self.constants.temp_mean) / self.constants.temp_std
+
+    def normalize_temp(self, temp: torch.Tensor, bulk_temp: torch.Tensor) -> torch.Tensor:
+        return (temp - self.constants.temp_mean) / self.constants.temp_std
+
+    def unnormalize_temp(self, temp: torch.Tensor, bulk_temp: torch.Tensor) -> torch.Tensor:
+        return temp * self.constants.temp_std + self.constants.temp_mean
+
 class PhaseNormalizer(StandardNormalizer):
     r"""
     This is the same as the StandardNormalizer, but does NOT normalize the SDF. This is intended
@@ -350,6 +362,8 @@ def get_normalizer(normalizer_cfg: dict) -> Normalizer:
     )
     if normalizer_cfg["name"] == "standard":
         return StandardNormalizer(constants)
+    if normalizer_cfg["name"] == "nondim_temp":
+        return NonDimensionalTempNormalizer(constants)
     if normalizer_cfg["name"] == "phase":
         return PhaseNormalizer(constants)
     if normalizer_cfg["name"] == "divfree":
@@ -457,10 +471,11 @@ def main(cfg: DictConfig):
         y_size = sim_params_dict["y_max"] - sim_params_dict["y_min"]
         max_domain_size = max(max_domain_size, x_size, y_size)
 
-        absmax_temp = max(absmax_temp, np.abs(temp).max() - sim_params_dict["bulk_temp"])
+        temp_offset = 0.0 if cfg.get("nondimensional_temp", False) else sim_params_dict["bulk_temp"]
+        absmax_temp = max(absmax_temp, np.abs(temp).max() - temp_offset)
 
         sdf_running_variance.update(sdf)
-        temp_running_variance.update(temp - sim_params_dict["bulk_temp"])
+        temp_running_variance.update(temp - temp_offset)
         velx_running_variance.update(velx)
         vely_running_variance.update(vely)
 

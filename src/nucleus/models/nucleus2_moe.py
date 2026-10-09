@@ -8,6 +8,7 @@ from typing import Literal, Optional
 
 from nucleus.layers.adaptive_layernorm import AdaptiveLayerNorm
 from nucleus.layers.attention import NeighborhoodAttention
+from nucleus.layers.condition_encoder import ConditionEncoder
 from nucleus.layers.moe.topk_moe import TopkMoE, TopkMoEOutput, TopkRouterWithBias
 from nucleus.layers.droppath import DropPath
 from nucleus.layers import (
@@ -51,6 +52,12 @@ class Nucleus2MoEConfig:
     activation_dtype: NUCLEUS_DTYPE = "float32"
     attention_dtype: NUCLEUS_DTYPE = "bfloat16"
     moe_dtype: NUCLEUS_DTYPE = "bfloat16"
+    # static per-trajectory maps from nucleus.data.conditioning
+    num_condition_channels: int = 0
+    # "concat": appended to every frame's input channels; "additive": encoded separately and
+    # added to every frame's tokens, starting from zero
+    condition_injection: Literal["concat", "additive"] = "concat"
+    condition_maps: Literal["initial_state", "geometry"] = "initial_state"
 
 
 def _config_to_dict(config: Nucleus2MoEConfig) -> dict:
@@ -62,13 +69,13 @@ def _config_to_dict(config: Nucleus2MoEConfig) -> dict:
     return d
 
 
-def _config_from_dict(d: dict) -> Nucleus2MoEConfig:
+def _config_from_dict(d: dict, config_class: type = Nucleus2MoEConfig) -> Nucleus2MoEConfig:
     d = dict(d)
     dtype_fields = {"embed_dtype", "debed_dtype", "activation_dtype", "attention_dtype", "moe_dtype"}
     for key in dtype_fields:
         if not isinstance(d[key], torch.dtype):
             d[key] = _STR_TO_DTYPE[d[key]]
-    return Nucleus2MoEConfig(**d)
+    return config_class(**d)
 
 def get_dtype(dtype):
     if isinstance(dtype, str):
@@ -97,7 +104,10 @@ class TransformerMoEBlock(nn.Module):
             softmax_first=False
         )
 
-        self.attention = NeighborhoodAttention(embed_dim=config.embed_dim, num_heads=config.num_heads)
+        self.attention = NeighborhoodAttention(
+            embed_dim=config.embed_dim, num_heads=config.num_heads,
+            dtype=self.attention_dtype,
+        )
 
         self.mlp = TopkMoE(
             num_experts=config.num_experts,
@@ -172,10 +182,18 @@ class MoEBase(nn.Module):
         self.out_norm = nn.RMSNorm(config.embed_dim, dtype=self.debed_dtype)
         
         assert config.patching in ("Linear", "Adaptive")
+        num_condition_channels = getattr(config, "num_condition_channels", 0)
+        if config.patching != "Linear" and num_condition_channels:
+            raise ValueError("condition channels are only supported with Linear patching")
+        if num_condition_channels and not self.concatenates_condition:
+            self.condition_encoder = ConditionEncoder(
+                num_condition_channels, config.embed_dim, config.patch_size, dtype=self.embed_dtype
+            )
+            num_condition_channels = 0  # nothing extra enters the field embedding
         if config.patching == "Linear":    
             self.embed = LinearEmbed(
                 patch_size=config.patch_size,
-                in_channels=n_fields,
+                in_channels=n_fields + num_condition_channels,
                 embed_dim=config.embed_dim,
                 dtype=self.embed_dtype
             )
@@ -199,28 +217,43 @@ class MoEBase(nn.Module):
                 dtype=config.debed_dtype
             )
 
+    @property
+    def concatenates_condition(self) -> bool:
+        return getattr(self.config, "condition_injection", "concat") == "concat"
+
+    def _encode(self, frames: torch.Tensor, condition: Optional[torch.Tensor]) -> torch.Tensor:
+        embed = self.embed(frames.to(self.embed_dtype))
+        if condition is not None and not self.concatenates_condition:
+            # the maps are static, so every frame's tokens get the same offset
+            embed = embed + self.condition_encoder(condition.to(self.embed_dtype))[:, None]
+        return embed
+
     def get_extra_state(self):
         return {"model_name": getattr(self, "_model_name", None), "config": _config_to_dict(self.config)}
 
     def set_extra_state(self, state):
         self._model_name = state.get("model_name")
-        self.config = _config_from_dict(state["config"])
+        # subclasses may extend the config, so rebuild it with the subclass's own parser
+        self.config = self.config_from_dict(state["config"])
 
     def forward(self, batch: CollatedBatch) -> torch.Tensor:
-        return self.step(batch.input, batch.sim_params_tensor)
+        return self.step(batch.input, batch.sim_params_tensor, condition=batch.condition)
 
-    def step(self, input: torch.Tensor, sim_params: torch.Tensor):
+    def step(self, input: torch.Tensor, sim_params: torch.Tensor, condition: Optional[torch.Tensor] = None):
         """
         input: (B, T, H, W, C)
         sim_params: (B, num_sim_params)
+        condition: optional static maps (B, H, W, K), appended to every frame
         """
         assert input.dtype == torch.float32
         assert sim_params.dtype == torch.float32
+        if condition is not None and self.concatenates_condition:
+            input = torch.cat([input, condition[:, None].expand(-1, input.shape[1], -1, -1, -1)], dim=-1)
         
         _, _, h, w, _ = input.shape
 
         with record_function("encode"):
-            x = embed = self.embed(input.to(self.embed_dtype))
+            x = embed = self._encode(input, condition)
             
         x = x.to(get_dtype(self.config.activation_dtype))
 
@@ -266,6 +299,7 @@ class MoEBase(nn.Module):
         use_sdf_reinit: bool = False,
         return_moe_outputs: bool = False,
         clip_temp: bool = False,
+        condition: Optional[torch.Tensor] = None,
     ):
         assert initial_state.dim() == 5, "initial state must be [B, T, H, W, C]"
         assert input_time_window_size <= initial_state.shape[1]
@@ -280,7 +314,7 @@ class MoEBase(nn.Module):
 
         for _ in range(input_time_window_size, trajectory_steps, output_time_window_size):
             normalized_window = normalizer.normalize(trajectory[:, -input_time_window_size:], bulk_temp)
-            pred, moe_outputs = self.step(normalized_window, sim_params)
+            pred, moe_outputs = self.step(normalized_window, sim_params, condition=condition)
             pred = normalizer.unnormalize(pred, bulk_temp)
             output_time_window = pred[:, -output_time_window_size:]
 

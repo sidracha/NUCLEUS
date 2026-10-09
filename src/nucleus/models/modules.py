@@ -32,8 +32,17 @@ from nucleus.noise import (
     FrameDropout,
     SpuriousBulkNucleation,
     BubbleResize,
-    InterfaceJitter
+    InterfaceJitter,
+    sdf_context_corruptions,
 )
+
+
+def default_input_augmentations() -> list:
+    return [
+        LogUniformNoise(0.001, 5e-2, skip_prob=0.1),
+        FieldDropout(),
+        #FrameDropout(),
+    ]
 
 
 class ModuleBase(L.LightningModule):
@@ -75,11 +84,10 @@ class ModuleBase(L.LightningModule):
         else:
             self.model = get_model(self.model_cfg["name"], **self.model_cfg["params"])
 
-        self.augmentations = [
-            LogUniformNoise(0.001, 5e-2, skip_prob=0.1),
-            FieldDropout(),
-            #FrameDropout(),
-        ]
+        self.augmentations = default_input_augmentations()
+        if self.model_cfg.get("sdf_corruptions", False):
+            constants = self.normalizer.constants
+            self.augmentations += sdf_context_corruptions(constants.sdf_mean, constants.sdf_std, constants.max_domain_size)
 
         self.t_max = None
         self.validation_sample = None
@@ -156,12 +164,12 @@ class ModuleBase(L.LightningModule):
     def configure_optimizers(self):
         opt_name = self.optimizer_cfg["name"]
         opt_params = self.optimizer_cfg["params"]
-        opt_params["lr"] = torch.tensor(opt_params["lr"])
+        opt_params["lr"] = float(opt_params["lr"])
         if opt_name == "adamw":
             weight_decay = opt_params.get("weight_decay", 0.0)
             adamw_kwargs = {key: value for key, value in opt_params.items() if key != "weight_decay"}
             param_groups = self._weight_decay_param_groups(weight_decay)
-            optimizer = [AdamW(param_groups, **adamw_kwargs, fused=True)]
+            optimizer = [AdamW(param_groups, **adamw_kwargs)]
         elif opt_name == "adam":
             optimizer = [Adam(self.model.parameters(), **opt_params)]
         elif opt_name == "lion":

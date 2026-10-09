@@ -1,5 +1,7 @@
 name: nucleus2_moe_fm
 train_module_name: flow_matching
+# velocity: network predicts dz/dt; endpoint: network predicts delta directly
+prediction_target: velocity
 layout: "t h w c"
 params:
   patch_size: 4

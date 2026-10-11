@@ -1,0 +1,27 @@
+name: nucleus2_moe_fm_concat
+train_module_name: flow_matching
+# velocity: network predicts dz/dt; endpoint: network predicts delta directly
+prediction_target: velocity
+# true: flow toward (target - last context frame); false: flow toward the clean target itself
+residual: true
+# training samples t = u ** flow_time_power (1 = uniform, >1 biases toward small t)
+flow_time_power: 1
+# add NUCLEUS's log-uniform input noise to the context frames during training
+context_noise: true
+# add SDF-aware corruptions (spurious specks, bubble resize, smooth warp, smooth noise) to the context
+sdf_corruptions: true
+layout: "t h w c"
+params:
+  patch_size: 4
+  embed_dim: 384
+  moe_intermediate_dim: 1024
+  processor_blocks: 8
+  num_heads: 6
+  num_experts: 6
+  topk: 2
+  patching: "Linear"
+  activation_dtype: "bfloat16"
+  # must equal history_time_window; sizes the channel-concatenated embedding
+  num_context_frames: ${history_time_window}
+  # 4 = x, y, nucleation-seed SDF, initial thermal layer (nucleus.data.conditioning); 0 = off
+  num_condition_channels: 0

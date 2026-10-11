@@ -149,7 +149,10 @@ class CollatedBatch:
         assert self.sim_params_tensor is not None
         return self.sim_params_tensor.to(device)
 
+from nucleus.data.normalize import _inject_sat_temp as _resolve_sat_temp
+
 def get_sim_params(sim_params_dict: Dict, fluid_params: List[str], heater_params: List[str], global_params: List[str]):
+    sim_params_dict = _resolve_sat_temp(sim_params_dict)
     fp = [sim_params_dict[param] for param in fluid_params]
     hp = [sim_params_dict["heater"][param] for param in heater_params]
     gp = [sim_params_dict[param] for param in global_params]

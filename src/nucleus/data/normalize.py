@@ -8,6 +8,24 @@ from typing import Optional, Callable, List
 import yaml
 from nucleus.data.layout import convert_layout
 
+_SAT_TEMP_BY_LIQUID = {
+    "fc72": 56.0,
+    "op250": 58.0,
+    "ln2": -196.0,
+    "lh2": -253.0,
+    "r1233zd": 18.0,
+    "r515b": -19.0,
+}
+
+def _inject_sat_temp(sim_params_dict: dict) -> dict:
+    """Add sat_temp from the liquid lookup for JSONs that predate the sat_temp field."""
+    if "sat_temp" in sim_params_dict:
+        return sim_params_dict
+    liquid = sim_params_dict.get("liquid")
+    if liquid not in _SAT_TEMP_BY_LIQUID:
+        raise KeyError(f"sat_temp missing and no known sat_temp for liquid '{liquid}'")
+    return {**sim_params_dict, "sat_temp": _SAT_TEMP_BY_LIQUID[liquid]}
+
 @dataclass
 class NormalizerConstants:
     max_domain_size: float
@@ -133,7 +151,7 @@ class Normalizer:
 
     def normalize_params(self, sim_params_dicts: List[dict]) -> List[dict]:
         return [
-            dict_normalize_helper(sim_params_dict, minmax_normalize, self.constants.numeric_sim_params_min, self.constants.numeric_sim_params_max)
+            dict_normalize_helper(_inject_sat_temp(sim_params_dict), minmax_normalize, self.constants.numeric_sim_params_min, self.constants.numeric_sim_params_max)
             for sim_params_dict in sim_params_dicts
         ]
 

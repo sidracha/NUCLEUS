@@ -30,13 +30,14 @@ max_epochs:
 max_steps: 20000
 val_check_interval:
 check_val_every_n_epoch: 1
+gradient_clip_val: 1.0
 batch_size: 16
 accumulate_grad_batches: 1
 
 history_time_window: 4
 future_time_window: 4
 time_step: 1
-start_time: 1600
+start_time: 200
 
 defaults:
   - _self_

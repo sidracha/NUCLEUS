@@ -58,6 +58,9 @@ class Nucleus2MoEConfig:
     # added to every frame's tokens, starting from zero
     condition_injection: Literal["concat", "additive"] = "concat"
     condition_maps: Literal["initial_state", "geometry"] = "initial_state"
+    # FM conditioning: sim_params and time_embed are each projected to cond_dim and summed.
+    # Only used by flow matching models; ignored by the base Nucleus2MoE.
+    cond_dim: int = 64
 
 
 def _config_to_dict(config: Nucleus2MoEConfig) -> dict:

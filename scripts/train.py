@@ -169,6 +169,11 @@ def main(cfg: DictConfig) -> None:
     
     normalizer = get_normalizer(OmegaConf.to_container(cfg.normalizer_cfg, resolve=True))
 
+    ar_schedule = cfg.model_cfg.get("ar_rollout_schedule", None)
+    if ar_schedule:
+        ar_rollout_steps = int(max(ar_schedule))
+    else:
+        ar_rollout_steps = int(cfg.model_cfg.get("ar_rollout_steps", 1))
     shared_dataset_kwargs = dict(
         history_time_window=cfg.history_time_window,
         future_time_window=cfg.future_time_window,
@@ -178,10 +183,14 @@ def main(cfg: DictConfig) -> None:
         layout=train_module.model.layout,
         normalizer=normalizer,
     )
+    # Training dataset returns ar_rollout_steps * future_time_window target frames so the
+    # training loop can roll context forward through multiple AR windows per gradient step.
+    train_future_window = cfg.future_time_window * ar_rollout_steps
+    train_dataset_kwargs = {**shared_dataset_kwargs, "future_time_window": train_future_window}
 
     pydataset = cfg.pydataset
     dataset_cls, collate_fn = get_pydataset(pydataset)
-    
+
     use_webdataset = pydataset == "forecast_web"
     if use_webdataset:
         train_shard_urls = list(braceexpand.braceexpand(list(cfg.data_cfg.train_paths)[0]))
@@ -190,7 +199,7 @@ def main(cfg: DictConfig) -> None:
             cache_dir=None,
             cache_size=0,
             augment=True,
-            **shared_dataset_kwargs,
+            **train_dataset_kwargs,
         )
         val_dataset = forecast_web_dataset(
             shard_urls=list(cfg.data_cfg.val_paths)[0],
@@ -213,7 +222,7 @@ def main(cfg: DictConfig) -> None:
         train_dataset = dataset_cls(
             filenames=cfg.data_cfg.train_paths,
             augment=True,
-            **shared_dataset_kwargs,
+            **train_dataset_kwargs,
             **hdf5_kwargs,
         )
         val_dataset = dataset_cls(

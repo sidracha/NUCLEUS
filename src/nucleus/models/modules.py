@@ -115,6 +115,15 @@ class ModuleBase(L.LightningModule):
         if isinstance(opt, list):
             return opt[0].param_groups[0]["lr"]
         return opt.param_groups[0]["lr"]
+
+    def _current_ar_steps(self) -> int:
+        import bisect
+        schedule = self.model_cfg.get("ar_rollout_schedule", None)
+        if schedule:
+            milestones = self.model_cfg.get("ar_rollout_milestones", [])
+            idx = bisect.bisect_right(milestones, self.global_step)
+            return int(schedule[min(idx, len(schedule) - 1)])
+        return int(self.model_cfg.get("ar_rollout_steps", 1))
     
     def log_step_metrics(self, log_dict: dict, pred: torch.Tensor, target: torch.Tensor, dx: float, dy: float, prefix: str):
         with torch.no_grad():
@@ -370,27 +379,52 @@ class MoEConditionedForecastModule(ModuleBase):
                 router_idx += 1
 
     def training_step(self, batch: CollatedBatch, batch_idx: int) -> torch.Tensor:
+        ar_steps = self._current_ar_steps()
+        max_ar_steps = int(max(self.model_cfg.get("ar_rollout_schedule", [self.model_cfg.get("ar_rollout_steps", 1)])))
+        future_window = batch.target.shape[1] // max_ar_steps
+
         with torch.no_grad():
             for aug in self.augmentations:
                 batch.input = aug(batch.input)
 
-        inp = batch.get_input()
         torch.compiler.cudagraph_mark_step_begin()
-        pred, moe_outputs = self.model(inp)
+        current_input = batch.input
+        total_loss = torch.zeros(1, device=batch.input.device, dtype=batch.input.dtype).squeeze()
 
-        data_loss = self.criterion(pred, batch.target)
-        aux_loss, router_has_loss = self._router_loss(moe_outputs)
-        loss = data_loss + aux_loss
+        for k in range(ar_steps):
+            target_k = batch.target[:, k * future_window : (k + 1) * future_window]
+            inp = CollatedBatch(
+                input=current_input,
+                target=None,
+                sim_params_dict=batch.sim_params_dict,
+                x_grid=batch.x_grid,
+                y_grid=batch.y_grid,
+                dx=batch.dx,
+                dy=batch.dy,
+                sim_params_tensor=batch.sim_params_tensor,
+                condition=batch.condition,
+            )
+            pred, moe_outputs = self.model(inp)
 
-        self._update_router_bias(moe_outputs)
+            data_loss = self.criterion(pred, target_k)
+            aux_loss, _ = self._router_loss(moe_outputs)
+            total_loss = total_loss + data_loss + aux_loss
+            self._update_router_bias(moe_outputs)
 
+            if k < ar_steps - 1:
+                current_input = torch.cat(
+                    [current_input[:, future_window:], pred.detach()], dim=1
+                )
+
+        loss = total_loss / ar_steps
         log_dict = {
             "train/loss": loss,
             "train/data_loss": data_loss,
+            "train/ar_steps": float(ar_steps),
             "train/step": self.global_step,
             "train/learning_rate": self.get_current_lr(),
         }
-        log_dict = self.log_step_metrics(log_dict, pred, batch.target, batch.dx, batch.dy, "train")
+        log_dict = self.log_step_metrics(log_dict, pred, target_k, batch.dx, batch.dy, "train")
         log_dict = self._moe_metrics(moe_outputs, log_dict, "train")
         self.default_log_dict(log_dict)
         return loss

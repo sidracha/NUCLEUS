@@ -33,15 +33,16 @@ class Nucleus2MoEFlowMatching(Nucleus2MoE):
     def __init__(self, config: Nucleus2MoEConfig):
         super().__init__(config)
         self.time_embed = FMTimeEmbed(config.embed_dim)
-        # Rebuild blocks: AdaptiveLayerNorm inside each block now takes
-        # (num_sim_params + embed_dim) features so t is visible inside attention + MoE.
-        # The base class built blocks with num_sim_params=13; replace them here.
-        aug_num_sim_params = self.num_sim_params + config.embed_dim
+        # Project sim_params and time embedding to the same cond_dim, then add them.
+        # This gives sim_params and flow time equal influence over AdaptiveLayerNorm,
+        # rather than the old concat where 13-dim physics was swamped by embed_dim-dim time.
+        self.sim_condition_proj = nn.Linear(self.num_sim_params, config.cond_dim)
+        self.time_condition_proj = nn.Linear(config.embed_dim, config.cond_dim)
         drop_path_probs = torch.linspace(0.0, 0.1, config.processor_blocks)
         self.blocks = nn.ModuleList([
             TransformerMoEBlock(
                 config=config,
-                num_sim_params=aug_num_sim_params,
+                num_sim_params=config.cond_dim,
                 drop_path_prob=drop_path_probs[idx].item(),
             )
             for idx in range(config.processor_blocks)
@@ -96,20 +97,19 @@ class Nucleus2MoEFlowMatching(Nucleus2MoE):
                     embed_t, embed_h, embed_w
                 )[None, :, :, :, None, :]
 
-        # Concat time embedding to sim_params so each block's AdaptiveLayerNorm
-        # (both attention and MoE paths) is conditioned on t without touching the
-        # residual stream between blocks.
-        time_features = self.time_embed(t)  # (B, embed_dim)
-        aug_sim_params = torch.cat([sim_params, time_features], dim=-1)  # (B, 13 + embed_dim)
+        cond = self.sim_condition_proj(sim_params) + self.time_condition_proj(self.time_embed(t))
 
         moe_outputs = []
         for idx, blk in enumerate(self.blocks):
             with record_function(f"block_{idx}"):
-                x, moe_output = blk(x, rotary_freqs, aug_sim_params)
+                x, moe_output = blk(x, rotary_freqs, cond)
                 moe_outputs.append(moe_output)
 
         with record_function("debed"):
-            x = self.out_norm(x.to(self.debed_dtype) + skip.to(self.debed_dtype))
+            # Scale skip by t so it contributes nothing at t=0 (pure noise) and
+            # fully at t=1 (clean endpoint), avoiding the +noise bias at early steps.
+            t_gate = t[:, :, None, None, None].to(self.debed_dtype)
+            x = self.out_norm(x.to(self.debed_dtype) + t_gate * skip.to(self.debed_dtype))
             x = self.debed(x[:, num_dropped_frames:, ...], target_shape=(h, w))
 
         return x.to(torch.float32), moe_outputs

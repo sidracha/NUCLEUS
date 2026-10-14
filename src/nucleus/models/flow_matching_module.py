@@ -60,6 +60,17 @@ class FlowMatchingModule(MoEConditionedForecastModule):
         # training draws t = u ** flow_time_power; powers above 1 put more samples at small t,
         # where the forecast must come from the context alone
         self.flow_time_power = float(self.model_cfg.get("flow_time_power", 1.0))
+        # std of the noise source; scalar or per-field list [dfun, temp, velx, vely].
+        # For residual=True, matching the empirical delta RMS per field avoids the model
+        # spending capacity on noise cancellation for slow fields like dfun (RMS ~0.05).
+        noise_std_cfg = self.model_cfg.get("noise_std", 1.0)
+        if isinstance(noise_std_cfg, (list, tuple)):
+            self.register_buffer(
+                "noise_std",
+                torch.tensor(noise_std_cfg, dtype=torch.float32),
+            )
+        else:
+            self.noise_std = float(noise_std_cfg)
         # residual: flow toward (target - last context frame); otherwise flow toward the clean target
         self.residual = bool(self.model_cfg.get("residual", True))
         # reuse NUCLEUS's own augmentation objects so both models see identically corrupted
@@ -79,15 +90,21 @@ class FlowMatchingModule(MoEConditionedForecastModule):
         return batch
 
     def _sample_flow(
-        self, batch: CollatedBatch, flow_time_power: float = 1.0
+        self, batch: CollatedBatch, flow_time_power: float = 1.0,
+        clean_anchor: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (model_input, t, v_target) for residual flow matching."""
         y = batch.target  # (B, T_out, H, W, C)
-        # the flow's endpoint: the change from the last context frame (broadcast over T_out), or the clean target itself
-        delta = y - batch.input[:, -1:] if self.residual else y  # (B, T_out, H, W, C)
+        # Use the pre-augmentation anchor so corrupted context doesn't shift the residual target.
+        anchor = clean_anchor if clean_anchor is not None else batch.input[:, -1:]
+        delta = y - anchor if self.residual else y  # (B, T_out, H, W, C)
         B = y.shape[0]
 
-        noise = torch.randn_like(delta)
+        if isinstance(self.noise_std, torch.Tensor):
+            std = self.noise_std.to(delta.device)[None, None, None, None, :]
+        else:
+            std = self.noise_std
+        noise = std * torch.randn_like(delta)
         t = torch.rand(B, device=y.device, dtype=y.dtype) ** flow_time_power
 
         t_bcast = t[:, None, None, None, None]
@@ -99,8 +116,9 @@ class FlowMatchingModule(MoEConditionedForecastModule):
 
         return model_input, t[:, None], v_target  # t: (B, 1) for AdaptiveLayerNorm
 
-    def _predict(self, batch: CollatedBatch, flow_time_power: float = 1.0) -> FlowPrediction:
-        model_input, flow_time, v_target = self._sample_flow(batch, flow_time_power)
+    def _predict(self, batch: CollatedBatch, flow_time_power: float = 1.0,
+                 clean_anchor: torch.Tensor | None = None) -> FlowPrediction:
+        model_input, flow_time, v_target = self._sample_flow(batch, flow_time_power, clean_anchor)
         num_input_frames = batch.input.shape[1]
         model_output, moe_outputs = self.model.step(
             model_input, batch.sim_params_tensor, flow_time, T_in=num_input_frames,
@@ -126,17 +144,52 @@ class FlowMatchingModule(MoEConditionedForecastModule):
 
     def training_step(self, batch: CollatedBatch, batch_idx: int) -> torch.Tensor:
         torch.compiler.cudagraph_mark_step_begin()
-        prediction = self._predict(self._augment_context(batch), self.flow_time_power)
-        trained_pred, trained_target = self._trained_pair(prediction)
+        ar_steps = self._current_ar_steps()
+        max_ar_steps = int(max(self.model_cfg.get("ar_rollout_schedule", [self.model_cfg.get("ar_rollout_steps", 1)])))
+        future_window = batch.target.shape[1] // max_ar_steps
 
-        data_loss = F.mse_loss(trained_pred, trained_target)
-        aux_loss, _ = self._router_loss(prediction.moe_outputs)
-        loss = data_loss + aux_loss
-        self._update_router_bias(prediction.moe_outputs)
+        current_input = batch.input
+        total_loss = torch.zeros(1, device=batch.input.device, dtype=batch.input.dtype).squeeze()
 
+        for k in range(ar_steps):
+            target_k = batch.target[:, k * future_window : (k + 1) * future_window]
+            batch_k = CollatedBatch(
+                input=current_input,
+                target=target_k,
+                sim_params_dict=batch.sim_params_dict,
+                x_grid=batch.x_grid,
+                y_grid=batch.y_grid,
+                dx=batch.dx,
+                dy=batch.dy,
+                sim_params_tensor=batch.sim_params_tensor,
+                condition=batch.condition,
+            )
+
+            clean_anchor = current_input[:, -1:].clone() if self.residual else None
+            # Only augment on the first step where context is ground truth
+            if k == 0:
+                batch_k = self._augment_context(batch_k)
+            prediction = self._predict(batch_k, self.flow_time_power, clean_anchor)
+            trained_pred, trained_target = self._trained_pair(prediction)
+
+            data_loss = F.mse_loss(trained_pred, trained_target)
+            aux_loss, _ = self._router_loss(prediction.moe_outputs)
+            total_loss = total_loss + data_loss + aux_loss
+            self._update_router_bias(prediction.moe_outputs)
+
+            if k < ar_steps - 1:
+                with torch.no_grad():
+                    predicted_frames = (clean_anchor + prediction.delta_pred if self.residual
+                                        else prediction.delta_pred)
+                current_input = torch.cat(
+                    [current_input[:, future_window:], predicted_frames.detach()], dim=1
+                )
+
+        loss = total_loss / ar_steps
         log_dict = {
             "train/loss": loss,
             "train/data_loss": data_loss,
+            "train/ar_steps": float(ar_steps),
             "train/step": self.global_step,
             "train/learning_rate": self.get_current_lr(),
         }

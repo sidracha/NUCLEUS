@@ -1,7 +1,7 @@
 """
 Compare rollout metrics between two inference runs.
-  run A: denim-capybara-59    (nucleus2 geom)
-  run B: vital-pine-60        (nucleus2 fm)
+  run A: effortless-lion-61   (nucleus2 geom medium)
+  run B: earthy-microwave-68  (nucleus2 fm concat medium)
 
 Metrics per case (matching previous compare tables):
   - vapor fraction MAE         (time-averaged |pred_vf - gt_vf|)
@@ -20,8 +20,8 @@ from scipy.ndimage import label
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 
-RUN_A = pathlib.Path.home() / "nucleus2_fm_logs/denim-capybara-59/checkpoints/rollouts"
-RUN_B = pathlib.Path.home() / "nucleus2_fm_logs/vital-pine-60/checkpoints/rollouts_fm_full_seed0"
+RUN_A = pathlib.Path.home() / "nucleus2_fm_logs/effortless-lion-61/checkpoints/rollouts"
+RUN_B = pathlib.Path.home() / "nucleus2_fm_logs/earthy-microwave-68/checkpoints/rollouts_fm_residual_seed0"
 
 FIELDS = ["dfun", "temperature", "velx", "vely"]
 # SDF/temperature are stored in physical units; grid is 128×128 cells on a 16×16 domain
@@ -166,8 +166,8 @@ METRIC_LABELS = [
 
 # ── print table ──────────────────────────────────────────────────────────────
 print()
-print(f"  run A : denim-capybara-59  (nucleus2 geom)")
-print(f"  run B : vital-pine-60      (nucleus2 fm)")
+print(f"  run A : effortless-lion-61   (nucleus2 geom medium)")
+print(f"  run B : earthy-microwave-68  (nucleus2 fm concat medium)")
 print()
 
 C = 14

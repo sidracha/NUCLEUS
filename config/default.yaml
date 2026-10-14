@@ -31,8 +31,8 @@ max_steps: 20000
 val_check_interval:
 check_val_every_n_epoch: 1
 gradient_clip_val: 1.0
-batch_size: 16
-accumulate_grad_batches: 1
+batch_size: 4
+accumulate_grad_batches: 4
 
 history_time_window: 4
 future_time_window: 4

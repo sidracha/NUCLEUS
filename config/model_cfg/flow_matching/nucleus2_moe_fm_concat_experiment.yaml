@@ -3,9 +3,11 @@ train_module_name: flow_matching
 # velocity: network predicts dz/dt; endpoint: network predicts delta directly
 prediction_target: velocity
 # true: flow toward (target - last context frame); false: flow toward the clean target itself
-residual: false
+residual: true
 # training samples t = u ** flow_time_power (1 = uniform, >1 biases toward small t)
-flow_time_power: 1.5
+flow_time_power: 1.0
+# std of the noise source; set to empirical delta RMS so noise scale matches the residual endpoint
+noise_std: [0.053, 0.171, 0.510, 0.394]  # per-field delta RMS: dfun, temperature, velx, vely
 # add NUCLEUS's log-uniform input noise to the context frames during training
 context_noise: true
 # add SDF-aware corruptions (spurious specks, bubble resize, smooth warp, smooth noise) to the context
@@ -14,6 +16,7 @@ layout: "t h w c"
 params:
   patch_size: 4
   embed_dim: 512
+  cond_dim: 64
   moe_intermediate_dim: 2048
   processor_blocks: 12
   num_heads: 8
@@ -24,4 +27,6 @@ params:
   # must equal history_time_window; sizes the channel-concatenated embedding
   num_context_frames: ${history_time_window}
   # 4 = x, y, nucleation-seed SDF, initial thermal layer (nucleus.data.conditioning); 0 = off
-  num_condition_channels: 0
+  num_condition_channels: 4
+  condition_injection: additive
+  condition_maps: geometry

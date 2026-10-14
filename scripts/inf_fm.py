@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import h5py
 import hydra
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from inf import save_trajectory_as_hdf5
 from nucleus.data.conditioning import condition_map_kind, condition_maps
@@ -13,6 +13,7 @@ from nucleus.data.normalize import get_normalizer
 from nucleus.models import load_model_from_checkpoint
 from nucleus.plot.plotting import plot_rollout, plot_rollout_stability
 from nucleus.utils.set_fp32_precision import set_fp32_precision
+from nucleus.utils.sdf_reinit import sdf_reinit_sussman
 
 FIELDS = ("dfun", "temperature", "velx", "vely")
 
@@ -35,29 +36,53 @@ def integrate_flow(
     residual: bool,
     prediction_target: str,
     generator: torch.Generator,
+    noise_std: float | list = 1.0,
     condition: torch.Tensor | None = None,
+    solver: str = "rk4",
 ) -> torch.Tensor:
     batch_size, num_input_frames, height, width, channels = context.shape
-    state = torch.randn(
+    raw = torch.randn(
         batch_size, num_output_frames, height, width, channels,
         device=context.device, generator=generator,
     )
+    if isinstance(noise_std, (list, tuple)):
+        std = torch.tensor(noise_std, device=context.device, dtype=raw.dtype)[None, None, None, None, :]
+    else:
+        std = noise_std
+    state = std * raw
     step_size = 1.0 / num_flow_steps
-    for step_index in range(num_flow_steps):
-        flow_time = torch.full((batch_size, 1), step_index * step_size, device=context.device)
-        model_input = torch.cat([context, state], dim=1)
-        model_output, _ = model.step(model_input, sim_params, flow_time, T_in=num_input_frames, condition=condition)
+
+    def velocity_at(s: torch.Tensor, t_scalar: float) -> torch.Tensor:
+        flow_time = torch.full((batch_size, 1), t_scalar, device=context.device)
+        model_input = torch.cat([context, s], dim=1)
+        v, _ = model.step(model_input, sim_params, flow_time, T_in=num_input_frames, condition=condition)
         if prediction_target == "endpoint":
-            # Euler steps stop at t = 1 - step_size, so (1 - t) is never zero
-            velocity = (model_output - state) / (1.0 - flow_time)[:, :, None, None, None]
+            remaining = max(1.0 - t_scalar, 1e-3)
+            return (v - s) / remaining
+        return v
+
+    for step_index in range(num_flow_steps):
+        t = step_index * step_size
+        if solver == "rk4":
+            k1 = velocity_at(state, t)
+            k2 = velocity_at(state + 0.5 * step_size * k1, t + 0.5 * step_size)
+            k3 = velocity_at(state + 0.5 * step_size * k2, t + 0.5 * step_size)
+            k4 = velocity_at(state + step_size * k3, t + step_size)
+            state = state + (step_size / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         else:
-            velocity = model_output
-        state = state + step_size * velocity
+            state = state + step_size * velocity_at(state, t)
 
     if residual:
-        # residual models learn target - last context frame, so re-anchor the flow endpoint
         return context[:, -1:] + state
     return state
+
+
+def noise_std_from_cfg(model_cfg: DictConfig) -> float | list:
+    noise_std = model_cfg.get("noise_std", 1.0)
+    # hydra hands lists over as ListConfig, which integrate_flow's list check doesn't recognise
+    if isinstance(noise_std, ListConfig):
+        return OmegaConf.to_container(noise_std)
+    return noise_std
 
 
 def rollout_condition(model, sim_params_dict: dict, normalizer, trajectory_shape, device):
@@ -76,6 +101,9 @@ def rollout(model, ground_truth: torch.Tensor, sim_params_dict: dict, normalizer
 
     condition = rollout_condition(model, sim_params_dict, normalizer, ground_truth.shape, device)
 
+    _, height, width, _ = ground_truth.shape
+    dx = (sim_params_dict["x_max"] - sim_params_dict["x_min"]) / width
+
     initial_window = slice(cfg.start_time, cfg.start_time + cfg.history_time_window)
     trajectory = ground_truth[initial_window][None].to(device)
     while trajectory.shape[1] < cfg.trajectory_steps:
@@ -83,9 +111,13 @@ def rollout(model, ground_truth: torch.Tensor, sim_params_dict: dict, normalizer
         normalized_forecast = integrate_flow(
             model, context, sim_params,
             cfg.future_time_window, cfg.num_flow_steps, cfg.model_cfg.get("residual", True),
-            cfg.model_cfg.get("prediction_target", "velocity"), generator, condition,
+            cfg.model_cfg.get("prediction_target", "velocity"), generator,
+            noise_std=noise_std_from_cfg(cfg.model_cfg), condition=condition,
+            solver=cfg.get("solver", "rk4"),
         )
         forecast = normalizer.unnormalize(normalized_forecast, bulk_temp)
+        # reinitialize SDF in physical space so ||∇φ||≈1 is maintained across windows
+        forecast[..., 0] = sdf_reinit_sussman(forecast[..., 0], dx=dx, n_iter=5)
         trajectory = torch.cat([trajectory, forecast], dim=1)
 
     return trajectory[0, :cfg.trajectory_steps].cpu()

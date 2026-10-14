@@ -101,7 +101,7 @@ def run_test(cfg, model, normalizer, test_file_path: str, trajectory_steps: int)
                 input_time_window_size=cfg.history_time_window,
                 output_time_window_size=cfg.future_time_window,
                 trajectory_steps=trajectory_steps,
-                use_sdf_reinit=False,
+                use_sdf_reinit=True,
                 return_moe_outputs=False,
                 clip_temp=False,
                 # only NUCLEUS-2 style models accept conditioning maps

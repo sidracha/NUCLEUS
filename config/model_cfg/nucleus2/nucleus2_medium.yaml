@@ -1,6 +1,10 @@
 name: nucleus2_moe
 train_module_name: moe_conditioned_forecast
 layout: "t h w c"
+# curriculum AR rollout: step up window length at each milestone (global steps)
+# dataset sizes itself to max(ar_rollout_schedule) * future_time_window frames
+ar_rollout_schedule: [1, 2, 4, 6]
+ar_rollout_milestones: [8000, 12000, 15000, 20000]
 params:
   patch_size: 4
   embed_dim: 384

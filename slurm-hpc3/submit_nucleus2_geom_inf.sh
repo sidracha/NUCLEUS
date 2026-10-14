@@ -24,9 +24,9 @@ export PYTHONNOUSERSITE=1
 python -c "import torch; print(torch.cuda.device_count()); print(torch.cuda.get_device_name(0)); x=torch.zeros(1, device='cuda'); print(x)"
 
 TORCH_COMPILE_DISABLE=1 PYTHONNOUSERSITE=1 python scripts/inf.py \
-    checkpoint_path=$HOME/nucleus2_fm_logs/denim-capybara-59/checkpoints/last.ckpt \
+    checkpoint_path=$HOME/nucleus2_fm_logs/cool-salad-69/checkpoints/last.ckpt \
     log_dir=$HOME/nucleus2_fm_logs \
-    model_cfg=nucleus2/nucleus2_experiment \
+    model_cfg=nucleus2/nucleus2_medium \
     +model_cfg.params.num_condition_channels=4 \
     +model_cfg.params.condition_injection=additive \
     +model_cfg.params.condition_maps=geometry \

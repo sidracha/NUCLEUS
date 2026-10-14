@@ -6,6 +6,7 @@ import h5py as h5
 import torch
 from torch.utils.data import Dataset
 from nucleus.data.batching import make_data
+from nucleus.data.conditioning import condition_maps
 from nucleus.data.normalize import Normalizer
 from nucleus.data.layout import convert_layout
 
@@ -89,6 +90,7 @@ class ForecastDataset(ForecastDatasetBase):
         layout: str,
         normalizer: Optional[Normalizer],
         augment: bool,
+        condition_map_kind: Optional[str] = None,
     ):
         super().__init__(
             filenames=filenames,
@@ -107,10 +109,11 @@ class ForecastDataset(ForecastDatasetBase):
         self.fluid_params = fluid_params
         self.heater_params = heater_params
         self.global_params = global_params
-        self.layout = layout  
+        self.layout = layout
         self.normalizer = normalizer
         self.augment = augment
-        
+        self.condition_map_kind = condition_map_kind
+
         self.data = None
 
         self.input_num_fields = len(self.input_fields)
@@ -126,6 +129,26 @@ class ForecastDataset(ForecastDatasetBase):
             with open(sim_params_file, "r", encoding="utf-8") as f:
                 sim_params_json = json.load(f)
             self.sim_params.append(sim_params_json)
+
+        # condition maps are small (H×W×K) and static per file, so precompute them now
+        self.condition = self._build_all_condition_maps() if condition_map_kind else None
+
+    def _build_all_condition_maps(self) -> list:
+        if self.normalizer is None:
+            raise ValueError("condition maps require a normalizer")
+        # open files temporarily to read spatial dims; _ensure_open handles the worker copies
+        result = []
+        for file_idx, (filename, sim_params) in enumerate(zip(self.filenames, self.sim_params)):
+            with h5.File(filename, "r") as h5_file:
+                _, height, width = h5_file[self.input_fields[0]].shape
+            result.append(condition_maps(sim_params, self.normalizer, height, width, self.condition_map_kind))
+        return result
+
+    def _condition_for(self, file_idx: int, flipped: bool) -> Optional[torch.Tensor]:
+        if self.condition is None:
+            return None
+        cond = self.condition[file_idx]
+        return torch.flip(cond, dims=[1]) if flipped else cond
 
     def _get_traj_len(self, traj_len: int) -> int:
         return traj_len - self.start_time - self.future_time_window - self.history_time_window + 1
@@ -153,14 +176,15 @@ class ForecastDataset(ForecastDatasetBase):
         sim_params = self.sim_params[file_idx]
         bulk_temp = int(sim_params["bulk_temp"])
 
-        if self.augment and random.random() < 0.5:
+        flipped = self.augment and random.random() < 0.5
+        if flipped:
             # [T H W C], we flip along the width (dim=2)
             inp_data = torch.flip(inp_data, dims=[2])
             out_data = torch.flip(out_data, dims=[2])
             # Flipping the x-velocity requires it's sign to be negated (i.e., the flow is changed from
-            # going left to going towards the right), 
-            # this has to be applied before the following normalization because the normalization may 
-            # shift the mean x-velocity and change the sign. 
+            # going left to going towards the right),
+            # this has to be applied before the following normalization because the normalization may
+            # shift the mean x-velocity and change the sign.
             inp_data[..., 2] *= -1
             out_data[..., 2] *= -1
 
@@ -168,7 +192,7 @@ class ForecastDataset(ForecastDatasetBase):
             inp_data = self.normalizer.normalize(inp_data, bulk_temp)
             out_data = self.normalizer.normalize(out_data, bulk_temp)
             sim_params = self.normalizer.normalize_params([sim_params])[0]
-                
+
         inp_data = convert_layout(inp_data, self.layout)
         out_data = convert_layout(out_data, self.layout)
 
@@ -179,5 +203,6 @@ class ForecastDataset(ForecastDatasetBase):
             downsample_factor=1,
             fluid_params=self.fluid_params,
             heater_params=self.heater_params,
-            global_params=self.global_params
+            global_params=self.global_params,
+            condition=self._condition_for(file_idx, flipped),
         )

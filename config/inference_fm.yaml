@@ -11,7 +11,7 @@ start_time: 300
 trajectory_steps: 300
 
 # residual vs full-field and velocity vs endpoint are read from model_cfg, as in training
-num_flow_steps: 50
+num_flow_steps: 10
 seed: 0
 
 plot: true

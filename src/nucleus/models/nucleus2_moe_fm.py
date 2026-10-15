@@ -44,6 +44,7 @@ class Nucleus2MoEFlowMatching(Nucleus2MoE):
                 config=config,
                 num_sim_params=config.cond_dim,
                 drop_path_prob=drop_path_probs[idx].item(),
+                use_adaLN_gating=True,
             )
             for idx in range(config.processor_blocks)
         ])
@@ -106,10 +107,10 @@ class Nucleus2MoEFlowMatching(Nucleus2MoE):
                 moe_outputs.append(moe_output)
 
         with record_function("debed"):
-            # Scale skip by t so it contributes nothing at t=0 (pure noise) and
-            # fully at t=1 (clean endpoint), avoiding the +noise bias at early steps.
-            t_gate = t[:, :, None, None, None].to(self.debed_dtype)
-            x = self.out_norm(x.to(self.debed_dtype) + t_gate * skip.to(self.debed_dtype))
+            # No skip for velocity prediction: v* = delta - noise is constant in t,
+            # so the t-gated skip forces the transformer to learn a t-dependent
+            # cancellation strategy rather than the actual velocity field.
+            x = self.out_norm(x.to(self.debed_dtype))
             x = self.debed(x[:, num_dropped_frames:, ...], target_shape=(h, w))
 
         return x.to(torch.float32), moe_outputs

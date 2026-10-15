@@ -73,6 +73,17 @@ class FlowMatchingModule(MoEConditionedForecastModule):
             self.noise_std = float(noise_std_cfg)
         # residual: flow toward (target - last context frame); otherwise flow toward the clean target
         self.residual = bool(self.model_cfg.get("residual", True))
+
+        # per-field loss weights: explicitly set via config to upweight specific fields
+        # (e.g. field_loss_weights: [4.0, 1.0, 1.0, 1.0] to upweight dfun)
+        field_weights_cfg = self.model_cfg.get("field_loss_weights", None)
+        if field_weights_cfg is not None:
+            weights = torch.tensor(field_weights_cfg, dtype=torch.float32)
+            weights = weights / weights.mean()  # keep loss on same scale as unweighted MSE
+            self.register_buffer("field_loss_weights", weights)
+        else:
+            self.field_loss_weights = None
+
         # reuse NUCLEUS's own augmentation objects so both models see identically corrupted
         # context; field dropout is skipped because zeroing the anchor breaks the residual target
         wanted_types = ((LogUniformNoise,) if self.model_cfg.get("context_noise", False) else ()) \
@@ -137,6 +148,45 @@ class FlowMatchingModule(MoEConditionedForecastModule):
             delta_pred = zt + remaining * v_pred
         return FlowPrediction(flow_time, v_pred, v_target, delta_pred, delta, moe_outputs)
 
+    @torch.no_grad()
+    def _integrate_context(
+        self,
+        context: torch.Tensor,
+        future_window: int,
+        sim_params: torch.Tensor,
+        n_steps: int,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Short Euler integration to produce a predicted frame for the AR context roll.
+        Uses unaugmented context so the distribution matches inference."""
+        B, T_in, H, W, C = context.shape
+        if isinstance(self.noise_std, torch.Tensor):
+            std = self.noise_std.to(context.device)[None, None, None, None, :]
+        else:
+            std = self.noise_std
+        state = std * torch.randn(B, future_window, H, W, C,
+                                  device=context.device, dtype=context.dtype)
+        step_size = 1.0 / n_steps
+        for step_idx in range(n_steps):
+            t = torch.full((B, 1), step_idx * step_size,
+                           device=context.device, dtype=context.dtype)
+            model_input = torch.cat([context, state], dim=1)
+            v, _ = self.model.step(model_input, sim_params, t,
+                                   T_in=T_in, condition=condition)
+            if self.prediction_target == "endpoint":
+                velocity = (v - state) / max(1.0 - step_idx * step_size, 1e-3)
+            else:
+                velocity = v
+            state = state + step_size * velocity
+        return state  # delta_hat (residual) or full-field prediction
+
+    def _field_weighted_mse(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.field_loss_weights is None:
+            return F.mse_loss(pred, target)
+        # per-field MSE: mean over B, T, H, W; weighted sum over C
+        per_field = (pred - target).pow(2).mean(dim=(0, 1, 2, 3))  # (C,)
+        return (per_field * self.field_loss_weights).mean()
+
     def _trained_pair(self, prediction: FlowPrediction) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.prediction_target == "endpoint":
             return prediction.delta_pred, prediction.delta
@@ -172,17 +222,21 @@ class FlowMatchingModule(MoEConditionedForecastModule):
             prediction = self._predict(batch_k, self.flow_time_power, clean_anchor)
             trained_pred, trained_target = self._trained_pair(prediction)
 
-            data_loss = F.mse_loss(trained_pred, trained_target)
+            data_loss = self._field_weighted_mse(trained_pred, trained_target)
             aux_loss, _ = self._router_loss(prediction.moe_outputs)
             total_loss = total_loss + data_loss + aux_loss
             self._update_router_bias(prediction.moe_outputs)
 
             if k < ar_steps - 1:
-                with torch.no_grad():
-                    predicted_frames = (clean_anchor + prediction.delta_pred if self.residual
-                                        else prediction.delta_pred)
+                n_euler = int(self.model_cfg.get("ar_context_euler_steps", 4))
+                delta_hat = self._integrate_context(
+                    current_input, future_window, batch.sim_params_tensor,
+                    n_euler, condition=batch.condition,
+                )
+                predicted_frames = (current_input[:, -1:] + delta_hat
+                                    if self.residual else delta_hat)
                 current_input = torch.cat(
-                    [current_input[:, future_window:], predicted_frames.detach()], dim=1
+                    [current_input[:, future_window:], predicted_frames], dim=1
                 )
 
         loss = total_loss / ar_steps
@@ -205,7 +259,7 @@ class FlowMatchingModule(MoEConditionedForecastModule):
         # always uniform t, so validation averages stay comparable across training t distributions
         prediction = self._predict(batch)
         trained_pred, trained_target = self._trained_pair(prediction)
-        loss = F.mse_loss(trained_pred, trained_target)
+        loss = self._field_weighted_mse(trained_pred, trained_target)
 
         if batch_idx == 0:
             self.validation_sample = (batch.target.detach(), trained_target.detach(), trained_pred.detach())

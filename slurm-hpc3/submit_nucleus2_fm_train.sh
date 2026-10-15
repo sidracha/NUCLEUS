@@ -25,6 +25,8 @@ python -c "import torch; print(torch.cuda.device_count()); print(torch.cuda.get_
 
 PYTHONNOUSERSITE=1 python scripts/train.py \
   model_cfg=flow_matching/nucleus2_moe_fm_concat_medium \
+  model_cfg.ar_rollout_schedule=[1] \
+  model_cfg.ar_rollout_milestones=[] \
   data_cfg=poolboiling128 \
   data_dir=/share/crsp/lab/amowli/share/BubbleML_2_downsampled128_bicubic \
   start_time=200 \
@@ -33,8 +35,8 @@ PYTHONNOUSERSITE=1 python scripts/train.py \
   optim_cfg.params.lr=1e-3 \
   optim_cfg.params.weight_decay=0 \
   scheduler_cfg=cosine_warmup \
-  scheduler_cfg.params.warmup=3000 \
-  max_steps=60000 \
+  scheduler_cfg.params.warmup=4000 \
+  max_steps=80000 \
   val_check_interval=2000 \
   check_val_every_n_epoch=null \
   log_dir=$HOME/nucleus2_fm_logs

@@ -87,17 +87,28 @@ def get_dtype(dtype):
 
 
 class TransformerMoEBlock(nn.Module):
-    def __init__(self, config: Nucleus2MoEConfig, num_sim_params: int, drop_path_prob: float):
+    def __init__(self, config: Nucleus2MoEConfig, num_sim_params: int, drop_path_prob: float,
+                 use_adaLN_gating: bool = False):
         super().__init__()
 
         self.activation_dtype = get_dtype(config.activation_dtype)
         self.attention_dtype = get_dtype(config.attention_dtype)
         self.moe_dtype = get_dtype(config.moe_dtype)
+        self.use_adaLN_gating = use_adaLN_gating
 
         self.drop_path = DropPath(drop_path_prob)
 
         self.attention_norm = AdaptiveLayerNorm(config.embed_dim, num_sim_params, dtype=self.attention_dtype)
         self.mlp_norm = AdaptiveLayerNorm(config.embed_dim, num_sim_params, self.moe_dtype)
+
+        if use_adaLN_gating:
+            # zero-init so blocks start as identity; gates grow from zero as training proceeds
+            self.gate_attn = nn.Linear(num_sim_params, config.embed_dim)
+            self.gate_mlp = nn.Linear(num_sim_params, config.embed_dim)
+            nn.init.zeros_(self.gate_attn.weight)
+            nn.init.zeros_(self.gate_attn.bias)
+            nn.init.zeros_(self.gate_mlp.weight)
+            nn.init.zeros_(self.gate_mlp.bias)
 
         self.router = TopkRouterWithBias(
             config.num_experts,
@@ -125,8 +136,11 @@ class TransformerMoEBlock(nn.Module):
             h = x.to(self.attention_dtype)
             h = self.attention_norm(h, sim_params)
             h = self.attention(h, freqs)
-            h = self.drop_path(h)
-            x = x + h.to(self.activation_dtype)
+            h = self.drop_path(h).to(self.activation_dtype)
+            if self.use_adaLN_gating:
+                gate = self.gate_attn(sim_params.float())[:, None, None, None, :].to(self.activation_dtype)
+                h = gate * h
+            x = x + h
         return x
 
     def _mlp(self, x: torch.Tensor, sim_params: torch.Tensor):
@@ -134,8 +148,11 @@ class TransformerMoEBlock(nn.Module):
             h = x.to(self.moe_dtype)
             h = self.mlp_norm(h, sim_params)
             moe_output: TopkMoEOutput = self.mlp(h)
-            h = self.drop_path(moe_output.out)
-            x = x + h.to(self.activation_dtype)
+            h = self.drop_path(moe_output.out).to(self.activation_dtype)
+            if self.use_adaLN_gating:
+                gate = self.gate_mlp(sim_params.float())[:, None, None, None, :].to(self.activation_dtype)
+                h = gate * h
+            x = x + h
         return x, moe_output
 
     def forward(self, x: torch.Tensor, freqs: torch.Tensor, sim_params: torch.Tensor):

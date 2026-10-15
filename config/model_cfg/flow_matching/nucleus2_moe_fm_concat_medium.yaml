@@ -15,7 +15,9 @@ sdf_corruptions: true
 # curriculum AR rollout: step up window length at each milestone (global steps)
 # dataset sizes itself to max(ar_rollout_schedule) * future_time_window frames
 ar_rollout_schedule: [1, 2, 4, 6]
-ar_rollout_milestones: [15000, 30000, 50000, 60000]
+ar_rollout_milestones: [8000, 12000, 15000, 20000]
+# dfun is most physics-critical; velx/vely have large residuals and would otherwise dominate
+field_loss_weights: [4.0, 1.0, 1.0, 1.0]
 layout: "t h w c"
 params:
   patch_size: 4

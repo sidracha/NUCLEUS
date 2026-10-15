@@ -1,7 +1,7 @@
 """
 Compare rollout metrics between two inference runs.
-  run A: effortless-lion-61   (nucleus2 geom medium)
-  run B: earthy-microwave-68  (nucleus2 fm concat medium)
+  run A: effortless-lion-61   (nucleus2 geom medium, no AR)
+  run B: jolly-frog-74        (nucleus2 FM medium, no AR)
 
 Metrics per case (matching previous compare tables):
   - vapor fraction MAE         (time-averaged |pred_vf - gt_vf|)
@@ -20,8 +20,8 @@ from scipy.ndimage import label
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 
-RUN_A = pathlib.Path.home() / "nucleus2_fm_logs/effortless-lion-61/checkpoints/rollouts"
-RUN_B = pathlib.Path.home() / "nucleus2_fm_logs/earthy-microwave-68/checkpoints/rollouts_fm_residual_seed0"
+RUN_A = pathlib.Path.home() / "nucleus2_fm_logs/jolly-frog-74/checkpoints/rollouts_fm_residual_seed0"
+RUN_B = pathlib.Path("/pub/srachaba/nucleus2_fm_logs/serene-firefly-69/checkpoints/rollouts_fm_residual_seed0")
 
 FIELDS = ["dfun", "temperature", "velx", "vely"]
 # SDF/temperature are stored in physical units; grid is 128×128 cells on a 16×16 domain
@@ -128,6 +128,9 @@ def compute_metrics(pred, gt, sim_params):
     # eikonal (mean over full rollout; truth = 1)
     eik = float(eikonal_mag(pred["dfun"]).mean())
 
+    # per-field rollout MAE
+    per_field = {f"mae_{k}": float(np.abs(pred[k] - gt[k]).mean()) for k in FIELDS}
+
     return dict(
         vf_mae=vf_mae,
         bubble_count=bcount,
@@ -137,6 +140,7 @@ def compute_metrics(pred, gt, sim_params):
         lth_mae=lth_mae,
         lt_mae=lt_mae,
         eikonal=eik,
+        **per_field,
     )
 
 # ── run ──────────────────────────────────────────────────────────────────────
@@ -152,7 +156,8 @@ for case in cases:
                      compute_metrics(pred_b, gt_b, sp_b),
                      gt_a)   # store gt for reference
 
-METRIC_KEYS = ["vf_mae", "bubble_count", "rollout_mae", "rollout_err", "sdf_roughness", "lth_mae", "lt_mae", "eikonal"]
+METRIC_KEYS = ["vf_mae", "bubble_count", "rollout_mae", "rollout_err", "sdf_roughness", "lth_mae", "lt_mae", "eikonal",
+               "mae_dfun", "mae_temperature", "mae_velx", "mae_vely"]
 METRIC_LABELS = [
     "vapor fraction MAE",
     "mean bubble count",
@@ -162,12 +167,16 @@ METRIC_LABELS = [
     "liquid temp at heater MAE",
     "mean liquid temp MAE",
     "eikonal",
+    "  dfun MAE",
+    "  temperature MAE",
+    "  velx MAE",
+    "  vely MAE",
 ]
 
 # ── print table ──────────────────────────────────────────────────────────────
 print()
-print(f"  run A : effortless-lion-61   (nucleus2 geom medium)")
-print(f"  run B : earthy-microwave-68  (nucleus2 fm concat medium)")
+print(f"  run A : jolly-frog-74        (nucleus2 FM medium, fixed, no AR)")
+print(f"  run B : serene-firefly-69    (nucleus2 FM medium, broken AR)")
 print()
 
 C = 14

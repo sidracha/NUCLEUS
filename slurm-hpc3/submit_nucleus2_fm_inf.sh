@@ -24,7 +24,7 @@ export PYTHONNOUSERSITE=1
 python -c "import torch; print(torch.cuda.device_count()); print(torch.cuda.get_device_name(0)); x=torch.zeros(1, device='cuda'); print(x)"
 
 PYTHONNOUSERSITE=1 python scripts/inf_fm.py \
-  checkpoint_path=$HOME/nucleus2_fm_logs/serene-firefly-69/checkpoints/last.ckpt \
+  checkpoint_path=$HOME/nucleus2_fm_logs/jolly-frog-74/checkpoints/last.ckpt \
   model_cfg=flow_matching/nucleus2_moe_fm_concat_medium \
   data_dir=/share/crsp/lab/amowli/share/BubbleML_2_downsampled128_bicubic \
   data_cfg=poolboiling128 \

@@ -3,15 +3,19 @@ train_module_name: flow_matching
 # velocity: network predicts dz/dt; endpoint: network predicts delta directly
 prediction_target: velocity
 # true: flow toward (target - last context frame); false: flow toward the clean target itself
-residual: true
+residual: false
 # training samples t = u ** flow_time_power (1 = uniform, >1 biases toward small t)
 flow_time_power: 1.0
-# std of the noise source; set to empirical delta RMS so noise scale matches the residual endpoint
-noise_std: [0.053, 0.171, 0.510, 0.394]  # per-field delta RMS: dfun, temperature, velx, vely
+# fields are standardized to roughly unit variance, so uniform scalar noise gives balanced per-field SNR
+noise_std: 1.0
 # add NUCLEUS's log-uniform input noise to the context frames during training
 context_noise: true
 # add SDF-aware corruptions (spurious specks, bubble resize, smooth warp, smooth noise) to the context
 sdf_corruptions: true
+# curriculum AR rollout: step up window length at each milestone (global steps)
+# dataset sizes itself to max(ar_rollout_schedule) * future_time_window frames
+ar_rollout_schedule: [1, 2, 4, 6]
+ar_rollout_milestones: [8000, 12000, 15000, 20000]
 layout: "t h w c"
 params:
   patch_size: 4

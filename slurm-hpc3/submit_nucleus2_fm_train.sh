@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:RTX6000:1
 #SBATCH --time=2-23:59:00
 
 
@@ -24,7 +24,7 @@ export PYTHONNOUSERSITE=1
 python -c "import torch; print(torch.cuda.device_count()); print(torch.cuda.get_device_name(0)); x=torch.zeros(1, device='cuda'); print(x)"
 
 PYTHONNOUSERSITE=1 python scripts/train.py \
-  model_cfg=flow_matching/nucleus2_moe_fm_concat_medium \
+  model_cfg=flow_matching/nucleus2_moe_fm_concat_experiment \
   model_cfg.ar_rollout_schedule=[1] \
   model_cfg.ar_rollout_milestones=[] \
   data_cfg=poolboiling128 \
@@ -35,8 +35,8 @@ PYTHONNOUSERSITE=1 python scripts/train.py \
   optim_cfg.params.lr=1e-3 \
   optim_cfg.params.weight_decay=0 \
   scheduler_cfg=cosine_warmup \
-  scheduler_cfg.params.warmup=4000 \
-  max_steps=80000 \
+  scheduler_cfg.params.warmup=10000 \
+  max_steps=75000 \
   val_check_interval=2000 \
   check_val_every_n_epoch=null \
-  log_dir=$HOME/nucleus2_fm_logs
+  log_dir=/share/crsp/lab/amowli/srachaba/nucleus2_fm_logs

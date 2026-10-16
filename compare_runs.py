@@ -20,8 +20,8 @@ from scipy.ndimage import label
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 
-RUN_A = pathlib.Path.home() / "nucleus2_fm_logs/jolly-frog-74/checkpoints/rollouts_fm_residual_seed0"
-RUN_B = pathlib.Path("/pub/srachaba/nucleus2_fm_logs/serene-firefly-69/checkpoints/rollouts_fm_residual_seed0")
+RUN_A = pathlib.Path("/pub/srachaba/nucleus2_fm_logs/mild-elevator-78/checkpoints/rollouts_fm_residual_seed0")
+RUN_B = pathlib.Path("/share/crsp/lab/amowli/srachaba/nucleus2_fm_logs/fluent-dust-79/checkpoints/rollouts_fm_residual_seed0")
 
 FIELDS = ["dfun", "temperature", "velx", "vely"]
 # SDF/temperature are stored in physical units; grid is 128×128 cells on a 16×16 domain
@@ -84,9 +84,11 @@ def count_bubbles_at_frame(sdf_frame):
     labels = watershed(-sdf_frame, markers, mask=vapor)
     return int(labels.max())
 
-def mean_bubble_count(sdf):
-    """Mean bubble count over all frames."""
-    return np.mean([count_bubbles_at_frame(sdf[t]) for t in range(len(sdf))])
+def bubble_counts(sdf):
+    return np.array([count_bubbles_at_frame(sdf[t]) for t in range(len(sdf))])
+
+def mean_bubble_count_mae(pred_sdf, gt_sdf):
+    return float(np.abs(bubble_counts(pred_sdf) - bubble_counts(gt_sdf)).mean())
 
 def field_mae_at_frame(pred, gt, t=-1):
     """Mean absolute error across all 4 fields at a single frame."""
@@ -106,8 +108,8 @@ def compute_metrics(pred, gt, sim_params):
     vf_gt   = vapor_fraction(gt["dfun"])
     vf_mae  = float(np.abs(vf_pred - vf_gt).mean())
 
-    # mean bubble count (pred)
-    bcount = mean_bubble_count(pred["dfun"])
+    # bubble count MAE vs ground truth
+    bcount = mean_bubble_count_mae(pred["dfun"], gt["dfun"])
 
     # rollout error at final frame and over full trajectory
     rollout_err = field_mae_at_frame(pred, gt, t=-1)
@@ -160,7 +162,7 @@ METRIC_KEYS = ["vf_mae", "bubble_count", "rollout_mae", "rollout_err", "sdf_roug
                "mae_dfun", "mae_temperature", "mae_velx", "mae_vely"]
 METRIC_LABELS = [
     "vapor fraction MAE",
-    "mean bubble count",
+    "bubble count MAE",
     "rollout MAE (all frames)",
     "rollout error @ frame 199",
     "SDF roughness @ frame 199",
@@ -175,8 +177,8 @@ METRIC_LABELS = [
 
 # ── print table ──────────────────────────────────────────────────────────────
 print()
-print(f"  run A : jolly-frog-74        (nucleus2 FM medium, fixed, no AR)")
-print(f"  run B : serene-firefly-69    (nucleus2 FM medium, broken AR)")
+print(f"  run A : mild-elevator-78 (med FM, new config, ~78k steps)")
+print(f"  run B : fluent-dust-79   (large FM, new config, ~75k steps)")
 print()
 
 C = 14

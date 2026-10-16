@@ -313,6 +313,10 @@ def main(cfg: DictConfig) -> None:
     if is_leader_process():
         pp = pprint.PrettyPrinter(depth=4)
         pp.pprint(cfg)
+        config_save_path = Path(cfg.log_dir) / "checkpoints" / "train_config.yaml"
+        config_save_path.parent.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, config_save_path)
+        print(f"Training config saved to {config_save_path}")
 
     if cfg.get("validate_only", False):
         trainer.validate(train_module, dataloaders=val_dataloader)
